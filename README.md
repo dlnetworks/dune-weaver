@@ -1,3 +1,9 @@
+## 🚀 Enhanced Fork - Standalone & UI Improvements
+
+> **Note:** This is a fork of the original [Dune Weaver](https://github.com/tuanchris/dune-weaver) project with enhancements focused on standalone operation (no Raspberry Pi), improved performance, and additional features.
+
+---
+
 # Dune Weaver
 
 [![Patreon](https://img.shields.io/badge/Patreon-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/cw/DuneWeaver)
@@ -5,10 +11,6 @@
 ![Dune Weaver](./static/og-image.jpg)
 
 **An open-source kinetic sand art table that creates mesmerizing patterns using a ball controlled by precision motors.**
-
-## 🚀 Enhanced Fork - Standalone & UI Improvements
-
-> **Note:** This is a fork of the original [Dune Weaver](https://github.com/tuanchris/dune-weaver) project with enhancements focused on standalone operation (no Raspberry Pi), improved performance, and additional features.
 
 ### Major Enhancements
 
