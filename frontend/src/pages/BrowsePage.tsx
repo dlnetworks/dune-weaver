@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback, createContext, useContext } from 'react'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { toast } from 'sonner'
 import {
   initPreviewCacheDB,
@@ -34,6 +35,7 @@ interface PatternMetadata {
   category: string
   date_modified: number
   coordinates_count: number
+  estimated_duration?: string | null
 }
 
 interface PreviewData {
@@ -66,6 +68,9 @@ interface PreviewContextType {
 const PreviewContext = createContext<PreviewContextType | null>(null)
 
 export function BrowsePage() {
+  const navigate = useNavigate()
+  const location = useLocation()
+
   // Data state
   const [patterns, setPatterns] = useState<PatternMetadata[]>([])
   const [previews, setPreviews] = useState<Record<string, PreviewData>>({})
@@ -76,6 +81,10 @@ export function BrowsePage() {
   const [selectedCategory, setSelectedCategory] = useState<string>('all')
   const [sortBy, setSortBy] = useState<SortOption>('name')
   const [sortAsc, setSortAsc] = useState(true)
+  const [viewMode, setViewMode] = useState<'grid' | 'list'>(() => {
+    const cached = localStorage.getItem('browseViewMode')
+    return (cached as 'grid' | 'list') || 'grid'
+  })
 
   // Selection and panel state
   const [selectedPattern, setSelectedPattern] = useState<PatternMetadata | null>(null)
@@ -128,6 +137,21 @@ export function BrowsePage() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [isUploading, setIsUploading] = useState(false)
 
+  // Hover preview state (shared across all list items)
+  const [hoverPreview, setHoverPreview] = useState<{
+    pattern: PatternMetadata | null
+    previewUrl: string | null
+  }>({ pattern: null, previewUrl: null })
+
+  // Track if search bar is sticky (for shifting preview position)
+  const [isSearchBarSticky, setIsSearchBarSticky] = useState(false)
+
+  // Track current speeds from status updates
+  const [currentSpeed, setCurrentSpeed] = useState<number | null>(null)
+  const [clearSpeed, setClearSpeed] = useState<number | null>(null)
+  const lastSpeedRef = useRef<number | null>(null)
+  const lastClearSpeedRef = useRef<number | null>(null)
+
   // Swipe to dismiss sheet on mobile
   const sheetTouchStartRef = useRef<{ x: number; y: number } | null>(null)
   const handleSheetTouchStart = (e: React.TouchEvent) => {
@@ -165,6 +189,30 @@ export function BrowsePage() {
     localStorage.setItem('preExecution', preExecution)
   }, [preExecution])
 
+  // Persist view mode to localStorage
+  useEffect(() => {
+    localStorage.setItem('browseViewMode', viewMode)
+  }, [viewMode])
+
+  // Detect when search bar becomes sticky (scrolled past initial position)
+  useEffect(() => {
+    if (viewMode !== 'list') {
+      setIsSearchBarSticky(false)
+      return
+    }
+
+    const handleScroll = () => {
+      // Search bar becomes sticky when we've scrolled past its initial margin (164px)
+      const scrollThreshold = 164
+      setIsSearchBarSticky(window.scrollY > scrollThreshold)
+    }
+
+    window.addEventListener('scroll', handleScroll)
+    handleScroll() // Check initial state
+
+    return () => window.removeEventListener('scroll', handleScroll)
+  }, [viewMode])
+
   // Initialize IndexedDB cache and fetch patterns on mount
   useEffect(() => {
     initPreviewCacheDB().then(() => {
@@ -192,6 +240,66 @@ export function BrowsePage() {
     fetchPatterns()
     loadFavorites()
   })
+
+  // Handle opening pattern from Studio "Back to Browse" navigation
+  useEffect(() => {
+    if (location.state?.openPattern && patterns.length > 0) {
+      const patternPath = location.state.openPattern
+      const pattern = patterns.find(p => p.path === patternPath)
+
+      if (pattern) {
+        setSelectedPattern(pattern)
+        setIsPanelOpen(true)
+
+        // Clear the location state to prevent reopening on refresh
+        navigate(location.pathname, { replace: true, state: {} })
+      }
+    }
+  }, [location.state, patterns])
+
+  // Listen to status updates for speed changes
+  useEffect(() => {
+    const wsUrl = apiClient.getWebSocketUrl('/ws/status')
+    const ws = new WebSocket(wsUrl)
+
+    ws.onmessage = (event) => {
+      try {
+        const status = JSON.parse(event.data)
+
+        // Track base_speed and clear_pattern_speed
+        const newBaseSpeed = status.base_speed !== undefined ? status.base_speed : null
+        const newClearSpeed = status.clear_pattern_speed !== undefined ? status.clear_pattern_speed : null
+
+        setCurrentSpeed(newBaseSpeed)
+        setClearSpeed(newClearSpeed)
+
+        // Check if either speed changed
+        const baseSpeedChanged = lastSpeedRef.current !== null && lastSpeedRef.current !== newBaseSpeed
+        const clearSpeedChanged = lastClearSpeedRef.current !== null && lastClearSpeedRef.current !== newClearSpeed
+
+        if (baseSpeedChanged || clearSpeedChanged) {
+          // Trigger recalculation in background
+          apiClient.post('/api/duration-cache/start').catch(err => {
+            console.error('Failed to trigger duration recalculation:', err)
+          })
+
+          // Refresh patterns after a short delay to allow calculation to start
+          setTimeout(() => {
+            fetchPatterns()
+          }, 2000)
+        }
+
+        lastSpeedRef.current = newBaseSpeed
+        lastClearSpeedRef.current = newClearSpeed
+      } catch (err) {
+        console.error('Error parsing status update:', err)
+      }
+    }
+
+    return () => {
+      ws.close()
+    }
+  }, [])
 
   // Load favorites from "Favorites" playlist
   const loadFavorites = async () => {
@@ -855,7 +963,7 @@ export function BrowsePage() {
       />
 
       {/* Page Header */}
-      <div className="flex items-start justify-between gap-4 pl-1">
+      <div className="flex items-start justify-between gap-4 pl-1 relative z-20">
         <div className="space-y-0.5">
           <h1 className="text-xl font-semibold tracking-tight">Browse Patterns</h1>
           <p className="text-xs text-muted-foreground">
@@ -877,9 +985,63 @@ export function BrowsePage() {
         </Button>
       </div>
 
-      {/* Filter Bar */}
+      {/* Background mask to prevent list items from showing through preview area */}
+      {viewMode === 'list' && (
+        <div
+          className="fixed left-0 right-0 z-[15] bg-background transition-all duration-200"
+          style={{
+            top: 0,
+            height: isSearchBarSticky
+              ? 'calc(4.5rem + env(safe-area-inset-top, 0px) + 4rem + 10px + 160px + 2rem + 45px + 20px)'
+              : 'calc(4.5rem + env(safe-area-inset-top, 0px) + 1.5rem + 160px + 2rem + 45px + 20px)'
+          }}
+        />
+      )}
+
+      {/* Hover Preview Area - Fixed position, shifts down when search bar is sticky */}
+      {viewMode === 'list' && (
+        <div
+          className="fixed left-1/2 -translate-x-1/2 z-30 pointer-events-none flex flex-col items-center transition-all duration-200"
+          style={{
+            top: isSearchBarSticky
+              ? 'calc(4.5rem + env(safe-area-inset-top, 0px) + 4rem + 10px)'
+              : 'calc(4.5rem + env(safe-area-inset-top, 0px) + 1.5rem)'
+          }}
+        >
+          {hoverPreview.pattern && hoverPreview.previewUrl ? (
+            <>
+              <div className="w-40 h-40 sm:w-48 sm:h-48 rounded-lg overflow-hidden border-2 border-primary bg-muted shadow-2xl">
+                <img
+                  src={hoverPreview.previewUrl}
+                  alt={hoverPreview.pattern.name}
+                  className="w-full h-full object-cover pattern-preview"
+                />
+              </div>
+              <div className="mt-2 text-center bg-background/95 backdrop-blur-sm px-3 py-1.5 rounded-lg border border-border shadow-lg w-40 sm:w-48">
+                <p className="font-semibold text-sm truncate">
+                  {hoverPreview.pattern.name}
+                </p>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="w-40 h-40 sm:w-48 sm:h-48 rounded-lg border-2 border-dashed border-muted-foreground/30 bg-muted/30 flex items-center justify-center">
+                <p className="text-xs text-muted-foreground text-center px-4">
+                  Hover for preview
+                </p>
+              </div>
+              {/* Empty placeholder for name to maintain consistent height */}
+              <div className="mt-2 h-[2rem] w-40 sm:w-48" />
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Filter Bar - Sticky with higher z-index than mask, lower than preview */}
       <div
-        className="sticky z-30 py-3 -mx-0 sm:-mx-4 px-0 sm:px-4 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60"
+        className={`sticky z-20 py-3 -mx-0 sm:-mx-4 px-0 sm:px-4 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 ${
+          viewMode === 'list' ? 'mt-[164px]' : ''
+        }`}
         style={{ top: 'calc(4.5rem + env(safe-area-inset-top, 0px))' }}
       >
         <div className="flex items-center gap-2 sm:gap-3">
@@ -948,6 +1110,19 @@ export function BrowsePage() {
             </span>
           </Button>
 
+          {/* View mode toggle - Pill shaped, white background */}
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={() => setViewMode(viewMode === 'grid' ? 'list' : 'grid')}
+            className="shrink-0 h-9 w-9 sm:h-11 sm:w-11 rounded-full bg-card shadow-sm"
+            title={viewMode === 'grid' ? 'List view' : 'Grid view'}
+          >
+            <span className="material-icons-outlined text-lg sm:text-xl">
+              {viewMode === 'grid' ? 'view_list' : 'grid_view'}
+            </span>
+          </Button>
+
           {/* Cache button - Pill shaped, white background */}
           {!allCached && (
             <Button
@@ -1008,19 +1183,36 @@ export function BrowsePage() {
         </div>
       ) : (
         <PreviewContext.Provider value={{ requestPreview, previews }}>
-          <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-2 sm:gap-4">
-            {filteredPatterns.map((pattern) => (
-              <PatternCard
-                key={pattern.path}
-                pattern={pattern}
-                isSelected={selectedPattern?.path === pattern.path}
-                isFavorite={favorites.has(pattern.path)}
-                playTime={allPatternHistories[pattern.path.split('/').pop() || '']?.actual_time_formatted || null}
-                onToggleFavorite={toggleFavorite}
-                onClick={() => handlePatternClick(pattern)}
-              />
-            ))}
-          </div>
+          {viewMode === 'grid' ? (
+            <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-2 sm:gap-4 relative z-10">
+              {filteredPatterns.map((pattern) => (
+                <PatternCard
+                  key={pattern.path}
+                  pattern={pattern}
+                  isSelected={selectedPattern?.path === pattern.path}
+                  isFavorite={favorites.has(pattern.path)}
+                  playTime={allPatternHistories[pattern.path.split('/').pop() || '']?.actual_time_formatted || null}
+                  onToggleFavorite={toggleFavorite}
+                  onClick={() => handlePatternClick(pattern)}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1 relative z-10">
+              {filteredPatterns.map((pattern) => (
+                <PatternListItem
+                  key={pattern.path}
+                  pattern={pattern}
+                  isSelected={selectedPattern?.path === pattern.path}
+                  isFavorite={favorites.has(pattern.path)}
+                  playTime={pattern.estimated_duration || null}
+                  onToggleFavorite={toggleFavorite}
+                  onClick={() => handlePatternClick(pattern)}
+                  setHoverPreview={setHoverPreview}
+                />
+              ))}
+            </div>
+          )}
         </PreviewContext.Provider>
       )}
 
@@ -1205,6 +1397,20 @@ export function BrowsePage() {
                     Add to Queue
                   </Button>
                 </div>
+
+                {/* Open in Studio button */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full gap-1.5"
+                  onClick={() => {
+                    navigate('/studio', { state: { patternPath: selectedPattern.path } })
+                    setIsPanelOpen(false)
+                  }}
+                >
+                  <span className="material-icons-outlined text-base">draw</span>
+                  Open in Studio
+                </Button>
               </div>
             </div>
           )}
@@ -1400,7 +1606,14 @@ function PatternCard({ pattern, isSelected, isFavorite, playTime, onToggleFavori
           )}
         </div>
 
-        {/* Play time badge */}
+        {/* Estimated duration badge (top-left) */}
+        {pattern.estimated_duration && (
+          <div className="absolute -top-1 -left-1 bg-primary/90 backdrop-blur-sm text-primary-foreground text-[10px] font-medium px-1.5 py-0.5 rounded-full border border-primary shadow-sm">
+            {pattern.estimated_duration}
+          </div>
+        )}
+
+        {/* Play time badge (top-right) */}
         {playTime && (
           <div className="absolute -top-1 -right-1 bg-card/90 backdrop-blur-sm text-[10px] font-medium px-1.5 py-0.5 rounded-full border border-border shadow-sm">
             {(() => {
@@ -1465,6 +1678,83 @@ function PatternCard({ pattern, isSelected, isFavorite, playTime, onToggleFavori
           title={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
         >
           <span className="material-icons" style={{ fontSize: '16px' }}>
+            {isFavorite ? 'favorite' : 'favorite_border'}
+          </span>
+        </span>
+      </div>
+    </button>
+  )
+}
+
+// Pattern List Item Component (compact list view)
+interface PatternListItemProps extends PatternCardProps {
+  setHoverPreview: (preview: { pattern: PatternMetadata | null; previewUrl: string | null }) => void
+}
+
+function PatternListItem({ pattern, isSelected, isFavorite, playTime, onToggleFavorite, onClick, setHoverPreview }: PatternListItemProps) {
+  const itemRef = useRef<HTMLButtonElement>(null)
+  const context = useContext(PreviewContext)
+
+  // Request preview when hovering
+  const handleMouseEnter = () => {
+    if (context) {
+      context.requestPreview(pattern.path)
+      const previewUrl = context.previews[pattern.path]?.image_data || null
+      setHoverPreview({ pattern, previewUrl })
+    }
+  }
+
+  const handleMouseLeave = () => {
+    setHoverPreview({ pattern: null, previewUrl: null })
+  }
+
+  return (
+    <button
+      ref={itemRef}
+      onClick={onClick}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
+      className={`group flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-card border border-border transition-all duration-200 ease-out hover:shadow-md active:scale-[0.99] focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 ${
+        isSelected ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''
+      }`}
+    >
+      {/* Pattern Info */}
+      <div className="flex-1 min-w-0 text-left">
+        <span className="font-medium text-sm truncate block" title={pattern.name}>
+          {pattern.name}
+        </span>
+      </div>
+
+      {/* Duration */}
+      <div className="flex items-center gap-2 shrink-0 text-xs text-muted-foreground">
+        {playTime && (
+          <span className="flex items-center gap-1">
+            <span className="material-icons-outlined text-xs">schedule</span>
+            {playTime}
+          </span>
+        )}
+
+        {/* Favorite Button */}
+        <span
+          role="button"
+          tabIndex={0}
+          className={`transition-colors cursor-pointer ${
+            isFavorite ? 'text-red-500 hover:text-red-600' : 'text-muted-foreground hover:text-red-500'
+          }`}
+          onClick={(e) => {
+            e.stopPropagation()
+            onToggleFavorite(pattern.path, e)
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault()
+              e.stopPropagation()
+              onToggleFavorite(pattern.path, e as unknown as React.MouseEvent)
+            }
+          }}
+          title={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+        >
+          <span className="material-icons" style={{ fontSize: '18px' }}>
             {isFavorite ? 'favorite' : 'favorite_border'}
           </span>
         </span>

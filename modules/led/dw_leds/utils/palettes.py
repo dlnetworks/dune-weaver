@@ -5,7 +5,7 @@ Ported from WLED palettes.cpp
 All 59 gradient palettes from WLED
 """
 from typing import List, Tuple
-from .colors import color_blend, rgb_to_color
+from .colors import rgb_to_color
 
 # Gradient palette format: [(index, r, g, b), ...]
 # Index is 0-255 position in the palette

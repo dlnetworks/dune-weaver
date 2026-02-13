@@ -1,12 +1,10 @@
 import json
 import os
-import threading
 import logging
 import asyncio
 from typing import Optional
 from modules.core import pattern_manager
 from modules.core.state import state
-from fastapi import HTTPException
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -131,7 +129,7 @@ async def cancel_current_playlist():
             logger.warning(f"Error while cancelling playlist task: {e}")
         _current_playlist_task = None
 
-async def run_playlist(playlist_name, pause_time=0, clear_pattern=None, run_mode="single", shuffle=False):
+async def run_playlist(playlist_name, pause_time=0, clear_pattern=None, run_mode="single", shuffle=False, start_index=0):
     """Run a playlist with the given options."""
     global _current_playlist_task
 
@@ -155,18 +153,21 @@ async def run_playlist(playlist_name, pause_time=0, clear_pattern=None, run_mode
         logger.warning(f"Cannot run empty playlist: {playlist_name}")
         return False, "Playlist is empty"
 
+    # Validate and apply start_index
+    start_index = max(0, min(start_index, len(file_paths) - 1))
+
     try:
-        logger.info(f"Starting playlist '{playlist_name}' with mode={run_mode}, shuffle={shuffle}")
+        logger.info(f"Starting playlist '{playlist_name}' from index {start_index} with mode={run_mode}, shuffle={shuffle}")
         # Set ALL playlist state variables BEFORE creating the async task.
         # This ensures state is correct even if the task doesn't start immediately
         # (important for TestClient which may cancel background tasks).
         state.current_playlist = file_paths
+        state.current_playlist_index = start_index  # Set starting index
         state.current_playlist_name = playlist_name
         state.playlist_mode = run_mode
-        state.current_playlist_index = 0
-        # Set current_playing_file to the first pattern as a "preview" - this will be
+        # Set current_playing_file to the starting pattern as a "preview" - this will be
         # updated again when actual execution starts, but provides immediate UI feedback.
-        state.current_playing_file = file_paths[0] if file_paths else None
+        state.current_playing_file = file_paths[start_index] if file_paths else None
         _current_playlist_task = asyncio.create_task(
             pattern_manager.run_theta_rho_files(
                 file_paths,

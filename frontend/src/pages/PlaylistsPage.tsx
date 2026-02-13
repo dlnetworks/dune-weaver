@@ -43,6 +43,12 @@ export function PlaylistsPage() {
   const [allPatterns, setAllPatterns] = useState<PatternMetadata[]>([])
   const [previews, setPreviews] = useState<Record<string, PreviewData>>({})
 
+  // Pattern execution history
+  const [allPatternHistories, setAllPatternHistories] = useState<Record<string, {
+    actual_time_formatted: string | null
+    timestamp: string | null
+  }>>({})
+
   // Pattern picker modal state
   const [isPickerOpen, setIsPickerOpen] = useState(false)
   const [selectedPatternPaths, setSelectedPatternPaths] = useState<Set<string>>(new Set())
@@ -59,6 +65,16 @@ export function PlaylistsPage() {
   const [isRenameModalOpen, setIsRenameModalOpen] = useState(false)
   const [newPlaylistName, setNewPlaylistName] = useState('')
   const [playlistToRename, setPlaylistToRename] = useState<string | null>(null)
+
+  // Selected playlist item for playback start
+  const [selectedItemIndex, setSelectedItemIndex] = useState<number>(0)
+
+  // Drag and drop state
+  const [draggedIndex, setDraggedIndex] = useState<number | null>(null)
+  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null)
+
+  // Hover preview state
+  const [hoveredPattern, setHoveredPattern] = useState<string | null>(null)
 
   // Mobile view state - show content panel when a playlist is selected
   const [mobileShowContent, setMobileShowContent] = useState(false)
@@ -173,6 +189,140 @@ export function PlaylistsPage() {
     }
   }
 
+  // Helper to get clear pattern duration by name
+  const getClearPatternDurationByName = useCallback((baseName: string): number | null => {
+    // Look for patterns like "clear_from_in.thr", "clear_from_in_mini.thr", etc.
+    const clearPatternFound = allPatterns.find(p =>
+      p.name.startsWith(baseName) && p.path.startsWith('patterns/')
+    )
+
+    if (clearPatternFound?.estimated_duration) {
+      const duration = clearPatternFound.estimated_duration
+      let seconds = 0
+
+      if (duration === '<1m') {
+        seconds = 30
+      } else {
+        const hourMatch = duration.match(/(\d+)h/)
+        const minMatch = duration.match(/(\d+)m/)
+
+        if (hourMatch) seconds += parseInt(hourMatch[1]) * 3600
+        if (minMatch) seconds += parseInt(minMatch[1]) * 60
+      }
+
+      return seconds
+    }
+
+    return null
+  }, [allPatterns])
+
+  // Get clear pattern duration from actual pattern files (in seconds)
+  const estimateClearPatternDuration = useCallback((type: PreExecution): number => {
+    if (type === 'none') return 0
+
+    // Try to find actual clear pattern files and use their estimated durations
+    let patternName = ''
+
+    switch (type) {
+      case 'clear_from_in':
+        patternName = 'clear_from_in'
+        break
+      case 'clear_from_out':
+        patternName = 'clear_from_out'
+        break
+      case 'clear_sideway':
+        patternName = 'clear_sideway'
+        break
+      case 'adaptive':
+        // For adaptive, average the in and out durations
+        const inDuration = getClearPatternDurationByName('clear_from_in')
+        const outDuration = getClearPatternDurationByName('clear_from_out')
+        if (inDuration && outDuration) {
+          return (inDuration + outDuration) / 2
+        }
+        return 105 // Fallback estimate
+      default:
+        return 0
+    }
+
+    return getClearPatternDurationByName(patternName) || 120 // Fallback to 2 min estimate
+  }, [getClearPatternDurationByName])
+
+  // Calculate playlist duration breakdown
+  const playlistDurations = useMemo(() => {
+    if (!selectedPlaylist || playlistPatterns.length === 0) {
+      return null
+    }
+
+    let totalPatternSeconds = 0
+    let totalClearSeconds = 0
+    let totalPauseSeconds = 0
+
+    const pausePerPattern = getPauseTimeInSeconds()
+
+    // Calculate total pause time (between patterns, not after last one)
+    if (playlistPatterns.length > 1) {
+      totalPauseSeconds = pausePerPattern * (playlistPatterns.length - 1)
+    }
+
+    // Sum up pattern durations from allPatterns metadata
+    playlistPatterns.forEach(path => {
+      const patternMeta = allPatterns.find(p => p.path === path)
+      if (patternMeta?.estimated_duration) {
+        // Parse duration string like "5m", "1h 15m", "<1m"
+        const duration = patternMeta.estimated_duration
+        let seconds = 0
+
+        if (duration === '<1m') {
+          seconds = 30 // Estimate 30 seconds for <1m
+        } else {
+          const hourMatch = duration.match(/(\d+)h/)
+          const minMatch = duration.match(/(\d+)m/)
+
+          if (hourMatch) seconds += parseInt(hourMatch[1]) * 3600
+          if (minMatch) seconds += parseInt(minMatch[1]) * 60
+        }
+
+        totalPatternSeconds += seconds
+
+        // Add clear pattern duration if enabled
+        if (clearPattern !== 'none') {
+          // Estimate clear pattern duration based on type
+          // These are approximations - could be fetched from backend if needed
+          const clearDuration = estimateClearPatternDuration(clearPattern)
+          totalClearSeconds += clearDuration
+        }
+      }
+    })
+
+    const totalSeconds = totalPatternSeconds + totalClearSeconds + totalPauseSeconds
+
+    return {
+      patterns: totalPatternSeconds,
+      clears: totalClearSeconds,
+      pauses: totalPauseSeconds,
+      total: totalSeconds
+    }
+  }, [selectedPlaylist, playlistPatterns, allPatterns, clearPattern, pauseTime, pauseUnit, estimateClearPatternDuration])
+
+  // Format seconds to days/hours/mins/secs
+  const formatDuration = (totalSeconds: number): string => {
+    if (totalSeconds === 0) return '0s'
+
+    const days = Math.floor(totalSeconds / 86400)
+    const hours = Math.floor((totalSeconds % 86400) / 3600)
+    const mins = Math.floor((totalSeconds % 3600) / 60)
+    const secs = Math.floor(totalSeconds % 60)
+
+    const parts: string[] = []
+    if (days > 0) parts.push(`${days}d`)
+    if (hours > 0) parts.push(`${hours}h`)
+    if (mins > 0) parts.push(`${mins}m`)
+    if (secs > 0 || parts.length === 0) parts.push(`${secs}s`)
+
+    return parts.join(' ')
+  }
+
   // Preview loading
   const pendingPreviewsRef = useRef<Set<string>>(new Set())
   const batchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -222,6 +372,7 @@ export function PlaylistsPage() {
     try {
       const data = await apiClient.get<{ files: string[] }>(`/get_playlist?name=${encodeURIComponent(name)}`)
       setPlaylistPatterns(data.files || [])
+      setSelectedItemIndex(0) // Reset selection to first item
 
       // Previews are now lazy-loaded via IntersectionObserver in LazyPatternPreview
     } catch (error) {
@@ -233,8 +384,13 @@ export function PlaylistsPage() {
 
   const fetchAllPatterns = async () => {
     try {
-      const data = await apiClient.get<PatternMetadata[]>('/list_theta_rho_files_with_metadata')
+      // Fetch patterns and history in parallel
+      const [data, historyData] = await Promise.all([
+        apiClient.get<PatternMetadata[]>('/list_theta_rho_files_with_metadata'),
+        apiClient.get<Record<string, { actual_time_formatted: string | null; timestamp: string | null }>>('/api/pattern_history_all')
+      ])
       setAllPatterns(data)
+      setAllPatternHistories(historyData)
     } catch (error) {
       console.error('Error fetching patterns:', error)
     }
@@ -391,22 +547,84 @@ export function PlaylistsPage() {
     }
   }
 
-  const handleRemovePattern = async (patternPath: string) => {
+  const handleRemovePattern = async (index: number) => {
     if (!selectedPlaylist) return
 
-    const newPatterns = playlistPatterns.filter(p => p !== patternPath)
+    const newPatterns = [...playlistPatterns]
+    newPatterns.splice(index, 1)
+
     try {
       await apiClient.post('/modify_playlist', { playlist_name: selectedPlaylist, files: newPatterns })
       setPlaylistPatterns(newPatterns)
       toast.success('Pattern removed')
+
+      // Adjust selection after removal
+      if (selectedItemIndex === index) {
+        // If we removed the selected item, select the next one (or previous if it was last)
+        setSelectedItemIndex(Math.min(selectedItemIndex, newPatterns.length - 1))
+      } else if (selectedItemIndex > index) {
+        // If we removed an item before the selected one, shift selection down
+        setSelectedItemIndex(selectedItemIndex - 1)
+      }
     } catch (error) {
       toast.error('Failed to remove pattern')
     }
   }
 
+  // Drag and drop handlers
+  const handleDragStart = (e: React.DragEvent, index: number) => {
+    setDraggedIndex(index)
+    setHoveredPattern(null) // Clear hover preview during drag
+    e.dataTransfer.effectAllowed = 'move'
+  }
+
+  const handleDragOver = (e: React.DragEvent, index: number) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    setDragOverIndex(index)
+  }
+
+  const handleDragLeave = () => {
+    setDragOverIndex(null)
+  }
+
+  const handleDrop = async (e: React.DragEvent, dropIndex: number) => {
+    e.preventDefault()
+
+    if (draggedIndex === null || draggedIndex === dropIndex || !selectedPlaylist) return
+
+    const newPatterns = [...playlistPatterns]
+    const [draggedItem] = newPatterns.splice(draggedIndex, 1)
+    newPatterns.splice(dropIndex, 0, draggedItem)
+
+    try {
+      await apiClient.post('/modify_playlist', { playlist_name: selectedPlaylist, files: newPatterns })
+      setPlaylistPatterns(newPatterns)
+
+      // Update selected index if it moved
+      if (selectedItemIndex === draggedIndex) {
+        setSelectedItemIndex(dropIndex)
+      } else if (draggedIndex < selectedItemIndex && dropIndex >= selectedItemIndex) {
+        setSelectedItemIndex(selectedItemIndex - 1)
+      } else if (draggedIndex > selectedItemIndex && dropIndex <= selectedItemIndex) {
+        setSelectedItemIndex(selectedItemIndex + 1)
+      }
+    } catch (error) {
+      toast.error('Failed to reorder playlist')
+    }
+
+    setDraggedIndex(null)
+    setDragOverIndex(null)
+  }
+
+  const handleDragEnd = () => {
+    setDraggedIndex(null)
+    setDragOverIndex(null)
+  }
+
   // Pattern picker modal
   const openPatternPicker = () => {
-    setSelectedPatternPaths(new Set(playlistPatterns))
+    setSelectedPatternPaths(new Set()) // Start with empty selection
     setSearchQuery('')
     setIsPickerOpen(true)
     // Previews are lazy-loaded via IntersectionObserver in LazyPatternPreview
@@ -415,12 +633,25 @@ export function PlaylistsPage() {
   const handleSavePatterns = async () => {
     if (!selectedPlaylist) return
 
-    const newPatterns = Array.from(selectedPatternPaths)
+    const patternsToAdd = Array.from(selectedPatternPaths)
+
+    if (patternsToAdd.length === 0) {
+      setIsPickerOpen(false)
+      return
+    }
+
+    // Insert patterns after the selected item
+    const newPatterns = [...playlistPatterns]
+    const insertIndex = selectedItemIndex + 1
+    newPatterns.splice(insertIndex, 0, ...patternsToAdd)
+
     try {
       await apiClient.post('/modify_playlist', { playlist_name: selectedPlaylist, files: newPatterns })
       setPlaylistPatterns(newPatterns)
+      // Set selection to the last newly added item
+      setSelectedItemIndex(insertIndex + patternsToAdd.length - 1)
       setIsPickerOpen(false)
-      toast.success('Playlist updated')
+      toast.success(`Added ${patternsToAdd.length} pattern${patternsToAdd.length !== 1 ? 's' : ''} after item ${selectedItemIndex + 1}`)
       // Previews are lazy-loaded via IntersectionObserver
     } catch (error) {
       toast.error('Failed to update playlist')
@@ -451,8 +682,12 @@ export function PlaylistsPage() {
         pause_time: getPauseTimeInSeconds(),
         clear_pattern: clearPattern,
         shuffle: shuffle,
+        start_index: selectedItemIndex, // Start from selected item
       })
-      toast.success(`Started playlist: ${selectedPlaylist}`)
+      const startMsg = selectedItemIndex > 0
+        ? `Started playlist from item ${selectedItemIndex + 1}`
+        : `Started playlist: ${selectedPlaylist}`
+      toast.success(startMsg)
       // Trigger Now Playing bar to open
       window.dispatchEvent(new CustomEvent('playback-started'))
     } catch (error) {
@@ -632,17 +867,56 @@ export function PlaylistsPage() {
               >
                 <span className="material-icons-outlined">arrow_back</span>
               </Button>
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 <h2 className="text-lg font-semibold truncate">
                   {selectedPlaylist || 'Select a Playlist'}
                 </h2>
                 {selectedPlaylist && playlistPatterns.length > 0 && (
-                  <p className="text-sm text-muted-foreground">
-                    {playlistPatterns.length} pattern{playlistPatterns.length !== 1 ? 's' : ''}
-                  </p>
+                  <div className="space-y-0.5">
+                    <p className="text-sm text-muted-foreground">
+                      {playlistPatterns.length} pattern{playlistPatterns.length !== 1 ? 's' : ''}
+                    </p>
+                    {playlistDurations && (
+                      <div className="text-xs space-y-0.5">
+                        <div className="font-semibold text-foreground">
+                          Total: {formatDuration(playlistDurations.total)}
+                        </div>
+                        <div className="text-muted-foreground flex flex-wrap gap-x-3 gap-y-0.5">
+                          <span>Patterns: {formatDuration(playlistDurations.patterns)}</span>
+                          {playlistDurations.clears > 0 && (
+                            <span>Clears: {formatDuration(playlistDurations.clears)}</span>
+                          )}
+                          {playlistDurations.pauses > 0 && (
+                            <span>Pauses: {formatDuration(playlistDurations.pauses)}</span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
             </div>
+
+            {/* Hover Preview - centered */}
+            {selectedPlaylist && playlistPatterns.length > 0 && (
+              <div className="flex-shrink-0 mx-4 hidden sm:block">
+                {hoveredPattern ? (
+                  <div className="w-24 h-24 rounded-lg overflow-hidden border-2 border-primary shadow-lg bg-muted">
+                    <LazyPatternPreview
+                      path={hoveredPattern}
+                      previewUrl={getPreviewUrl(hoveredPattern)}
+                      requestPreview={requestPreview}
+                      alt={getPatternName(hoveredPattern)}
+                    />
+                  </div>
+                ) : (
+                  <div className="w-24 h-24 rounded-lg border-2 border-dashed border-muted-foreground/30 bg-muted/50 flex items-center justify-center">
+                    <p className="text-xs text-muted-foreground text-center px-2">Hover to preview</p>
+                  </div>
+                )}
+              </div>
+            )}
+
             <Button
               onClick={openPatternPicker}
               disabled={!selectedPlaylist}
@@ -681,32 +955,112 @@ export function PlaylistsPage() {
                 </Button>
               </div>
             ) : (
-              <div className="grid grid-cols-4 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-3 sm:gap-4">
-                {playlistPatterns.map((path, index) => (
-                  <div
-                    key={`${path}-${index}`}
-                    className="flex flex-col items-center gap-1.5 sm:gap-2 group"
-                  >
-                    <div className="relative w-full aspect-square">
-                      <div className="w-full h-full rounded-full overflow-hidden border bg-muted hover:ring-2 hover:ring-primary hover:ring-offset-2 hover:ring-offset-background transition-all cursor-pointer">
-                        <LazyPatternPreview
-                          path={path}
-                          previewUrl={getPreviewUrl(path)}
-                          requestPreview={requestPreview}
-                          alt={getPatternName(path)}
-                        />
+              <div className="space-y-1">
+                {playlistPatterns.map((path, index) => {
+                  const patternMeta = allPatterns.find(p => p.path === path)
+                  const isSelected = index === selectedItemIndex
+                  const isDragging = index === draggedIndex
+                  const isDragOver = index === dragOverIndex
+                  // Get last run time - extract filename from path (handles both "file.thr" and "patterns/file.thr")
+                  const fileName = path.split('/').pop() || ''
+                  const playTime = allPatternHistories[fileName]?.actual_time_formatted || null
+
+                  return (
+                    <div
+                      key={`${path}-${index}`}
+                      draggable
+                      onDragStart={(e) => handleDragStart(e, index)}
+                      onDragOver={(e) => handleDragOver(e, index)}
+                      onDragLeave={handleDragLeave}
+                      onDrop={(e) => handleDrop(e, index)}
+                      onDragEnd={handleDragEnd}
+                      onClick={() => setSelectedItemIndex(index)}
+                      onMouseEnter={() => setHoveredPattern(path)}
+                      onMouseLeave={() => setHoveredPattern(null)}
+                      className={`
+                        flex items-center gap-2.5 px-3 py-2 rounded-lg border cursor-pointer transition-all
+                        ${isSelected ? 'bg-primary/10 border-primary ring-2 ring-primary ring-offset-2 ring-offset-background' : 'bg-card border-border hover:bg-muted'}
+                        ${isDragging ? 'opacity-50' : ''}
+                        ${isDragOver && !isDragging ? 'border-primary border-t-2' : ''}
+                      `}
+                    >
+                      {/* Drag handle */}
+                      <div className="flex-shrink-0 cursor-grab active:cursor-grabbing text-muted-foreground">
+                        <span className="material-icons-outlined text-base">drag_indicator</span>
                       </div>
+
+                      {/* Index number */}
+                      <div className="flex-shrink-0 w-7 text-center">
+                        <span className={`text-sm font-semibold ${isSelected ? 'text-primary' : 'text-muted-foreground'}`}>
+                          {index + 1}
+                        </span>
+                      </div>
+
+                      {/* Pattern name */}
+                      <div className="flex-1 min-w-0">
+                        <p className="font-medium truncate text-sm">{getPatternName(path)}</p>
+                      </div>
+
+                      {/* Estimated duration badge - blue/primary */}
+                      {patternMeta?.estimated_duration && (
+                        <div className="flex-shrink-0 bg-primary/90 backdrop-blur-sm text-primary-foreground text-[10px] font-medium px-1.5 py-0.5 rounded-full border border-primary shadow-sm">
+                          {patternMeta.estimated_duration}
+                        </div>
+                      )}
+
+                      {/* Last run time badge - gray */}
+                      {playTime && (
+                        <div className="flex-shrink-0 bg-card/90 backdrop-blur-sm text-[10px] font-medium px-1.5 py-0.5 rounded-full border border-border shadow-sm">
+                          {(() => {
+                            // Parse time and convert to minutes only (same logic as BrowsePage)
+                            // Try MM:SS or HH:MM:SS format first (e.g., "15:48" or "1:15:48")
+                            const colonMatch = playTime.match(/^(?:(\d+):)?(\d+):(\d+)$/)
+                            if (colonMatch) {
+                              const hours = colonMatch[1] ? parseInt(colonMatch[1]) : 0
+                              const minutes = parseInt(colonMatch[2])
+                              const seconds = parseInt(colonMatch[3])
+                              const totalMins = hours * 60 + minutes + (seconds >= 30 ? 1 : 0)
+                              return totalMins > 0 ? `${totalMins}m` : '<1m'
+                            }
+
+                            // Try text-based formats
+                            const match = playTime.match(/(\d+)h\s*(\d+)m|(\d+)\s*min|(\d+)m\s*(\d+)s|(\d+)\s*sec/)
+                            if (match) {
+                              if (match[1] && match[2]) {
+                                // "Xh Ym" format
+                                return `${parseInt(match[1]) * 60 + parseInt(match[2])}m`
+                              } else if (match[3]) {
+                                // "X min" format
+                                return `${match[3]}m`
+                              } else if (match[4] && match[5]) {
+                                // "Xm Ys" format - round to minutes
+                                const mins = parseInt(match[4])
+                                return mins > 0 ? `${mins}m` : '<1m'
+                              } else if (match[6]) {
+                                // seconds only
+                                return '<1m'
+                              }
+                            }
+                            // Fallback: show original
+                            return playTime
+                          })()}
+                        </div>
+                      )}
+
+                      {/* Remove button */}
                       <button
-                        className="absolute -top-0.5 -right-0.5 sm:-top-1 sm:-right-1 w-5 h-5 rounded-full bg-destructive hover:bg-destructive/90 text-destructive-foreground flex items-center justify-center opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity shadow-sm z-10"
-                        onClick={() => handleRemovePattern(path)}
+                        className="flex-shrink-0 w-7 h-7 rounded-full hover:bg-destructive/20 text-destructive flex items-center justify-center transition-colors"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleRemovePattern(index)
+                        }}
                         title="Remove from playlist"
                       >
-                        <span className="material-icons" style={{ fontSize: '12px' }}>close</span>
+                        <span className="material-icons text-sm">close</span>
                       </button>
                     </div>
-                    <p className="text-[10px] sm:text-xs truncate font-medium w-full text-center">{getPatternName(path)}</p>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </div>
@@ -904,6 +1258,11 @@ export function PlaylistsPage() {
               <span className="material-icons-outlined text-primary">playlist_add</span>
               Add Patterns to {selectedPlaylist}
             </DialogTitle>
+            {playlistPatterns.length > 0 && (
+              <p className="text-sm text-muted-foreground pt-1">
+                Patterns will be inserted after item {selectedItemIndex + 1}
+              </p>
+            )}
           </DialogHeader>
 
           {/* Search and Filters */}
@@ -1036,9 +1395,13 @@ export function PlaylistsPage() {
             <Button variant="secondary" onClick={() => setIsPickerOpen(false)}>
               Cancel
             </Button>
-            <Button onClick={handleSavePatterns} className="gap-2">
-              <span className="material-icons-outlined text-base">save</span>
-              Save Selection
+            <Button
+              onClick={handleSavePatterns}
+              className="gap-2"
+              disabled={selectedPatternPaths.size === 0}
+            >
+              <span className="material-icons-outlined text-base">add</span>
+              Add {selectedPatternPaths.size > 0 ? `${selectedPatternPaths.size} Pattern${selectedPatternPaths.size !== 1 ? 's' : ''}` : 'Patterns'}
             </Button>
           </DialogFooter>
         </DialogContent>

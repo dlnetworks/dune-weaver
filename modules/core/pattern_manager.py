@@ -870,6 +870,28 @@ class MotionControlThread:
                     logger.info("Connection marked as disconnected due to device error")
                     return False
 
+                # Handle connection errors (WebSocket disconnected or broken)
+                if any(err in error_str for err in ["Connection timed out", "timed out", "Broken pipe", "Connection reset", "Errno 32", "Errno 54"]):
+                    timeout_retry_count += 1
+                    logger.warning(f"Motion thread: Connection error detected (attempt {timeout_retry_count}): {error_str}")
+
+                    # Try to reconnect WebSocket after every 5 failures
+                    if timeout_retry_count % 5 == 0 and isinstance(state.conn, connection_manager.WebSocketConnection):
+                        logger.warning(f"Motion thread: Attempting to reconnect WebSocket (after {timeout_retry_count} errors)...")
+                        try:
+                            state.conn.close()
+                            time.sleep(2)
+                            state.conn.connect()
+                            logger.info("Motion thread: WebSocket reconnected successfully")
+                            timeout_retry_count = 0  # Reset counter after successful reconnect
+                        except Exception as reconnect_error:
+                            logger.error(f"Motion thread: Failed to reconnect WebSocket: {reconnect_error}")
+                            logger.warning("Motion thread: Will keep retrying...")
+
+                    # Wait 5 seconds before retrying
+                    time.sleep(5)
+                    continue  # Skip the normal retry logic below
+
             # Retry on exception or corruption error
             logger.warning(f"Motion thread: Retrying {gcode}...")
             time.sleep(0.1)
@@ -1145,22 +1167,11 @@ def get_clear_pattern_file(clear_pattern_mode, path=None, cache_data=None):
         return table_patterns[clear_pattern_mode]
 
 def is_clear_pattern(file_path):
-    """Check if a file path is a clear pattern file."""
-    # Get all possible clear pattern files for all table types
-    clear_patterns = []
-    for table_type in ['dune_weaver', 'dune_weaver_mini', 'dune_weaver_pro']:
-        clear_patterns.extend([
-            f'./patterns/clear_from_out{("_" + table_type.split("_")[-1]) if table_type != "dune_weaver" else ""}.thr',
-            f'./patterns/clear_from_in{("_" + table_type.split("_")[-1]) if table_type != "dune_weaver" else ""}.thr',
-            f'./patterns/clear_sideway{("_" + table_type.split("_")[-1]) if table_type != "dune_weaver" else ""}.thr'
-        ])
-    
-    # Normalize paths for comparison
-    normalized_path = os.path.normpath(file_path)
-    normalized_clear_patterns = [os.path.normpath(p) for p in clear_patterns]
-    
-    # Check if the file path matches any clear pattern path
-    return normalized_path in normalized_clear_patterns
+    """Check if a file is a clear pattern (filename starts with 'clear_')."""
+    # Extract the filename from the path
+    filename = os.path.basename(file_path)
+    # Check if filename starts with "clear_"
+    return filename.startswith('clear_')
 
 async def _execute_pattern_internal(file_path):
     """Internal function to execute a pattern file. Must be called with lock already held.
@@ -1220,6 +1231,30 @@ async def _execute_pattern_internal(file_path):
     logger.info(f"Starting pattern execution: {file_path}")
     logger.info(f"t: {state.current_theta}, r: {state.current_rho}")
     await reset_theta()
+
+    # Set reference position for actual position tracking (inverse coordinate conversion)
+    state.reference_theta = state.current_theta
+    state.reference_rho = state.current_rho
+    state.reference_machine_x = state.machine_x
+    state.reference_machine_y = state.machine_y
+
+    # Start actual position tracking task if enabled
+    if state.enable_actual_position_tracking:
+        # Stop any existing tracking task
+        if state.actual_position_tracking_task and not state.actual_position_tracking_task.done():
+            state.actual_position_tracking_task.cancel()
+            try:
+                await state.actual_position_tracking_task
+            except asyncio.CancelledError:
+                pass
+
+        # Reset actual position to reference
+        state.actual_theta = state.reference_theta
+        state.actual_rho = state.reference_rho
+
+        # Start new tracking task
+        state.actual_position_tracking_task = asyncio.create_task(actual_position_tracker())
+        logger.info("Started actual position tracking task")
 
     start_time = time.time()
     total_pause_time = 0  # Track total time spent paused (manual + scheduled)
@@ -1453,15 +1488,97 @@ async def run_theta_rho_file(file_path, is_playlist=False, clear_pattern=None, c
         if not is_playlist and not progress_update_task:
             progress_update_task = asyncio.create_task(broadcast_progress())
 
-        # Run clear pattern first if specified
+        # Check if the file being run is itself a clear pattern (for manual selection)
+        is_main_file_clear_pattern = is_clear_pattern(file_path)
+
+        # Run post-execution command BEFORE clear pattern if this file is a clear pattern
+        if is_main_file_clear_pattern and state.post_execution_enabled and state.post_execution_command:
+            logger.info("=" * 60)
+            logger.info("POST-EXECUTION COMMAND (before manually selected clear pattern)")
+            logger.info(f"Command: {state.post_execution_command}")
+            logger.info("=" * 60)
+            try:
+                import subprocess
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    state.post_execution_command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30  # 30 second timeout
+                )
+
+                # Always show stdout if present
+                if result.stdout:
+                    logger.info(f"Command stdout:\n{result.stdout}")
+
+                # Always show stderr if present
+                if result.stderr:
+                    logger.info(f"Command stderr:\n{result.stderr}")
+
+                if result.returncode == 0:
+                    logger.info("Post-execution command completed successfully (exit code 0)")
+                else:
+                    logger.error(f"Post-execution command failed with exit code {result.returncode}")
+
+                logger.info("=" * 60)
+            except subprocess.TimeoutExpired:
+                logger.error("Post-execution command timed out after 30 seconds")
+                logger.info("=" * 60)
+            except Exception as e:
+                logger.error(f"Error running post-execution command: {e}")
+                logger.info("=" * 60)
+
+        # Run the main pattern
+        was_completed = await _execute_pattern_internal(file_path)
+
+        # Run clear pattern after main pattern if specified
         if clear_pattern and clear_pattern != 'none':
             clear_file_path = get_clear_pattern_file(clear_pattern, file_path, cache_data)
             if clear_file_path:
-                logger.info(f"Running pre-execution clear pattern: {clear_file_path}")
+                # Run post-execution command BEFORE clearing pattern if enabled
+                if was_completed and state.post_execution_enabled and state.post_execution_command:
+                    logger.info("=" * 60)
+                    logger.info("POST-EXECUTION COMMAND (before clearing pattern)")
+                    logger.info(f"Command: {state.post_execution_command}")
+                    logger.info("=" * 60)
+                    try:
+                        import subprocess
+                        result = await asyncio.to_thread(
+                            subprocess.run,
+                            state.post_execution_command,
+                            shell=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=30  # 30 second timeout
+                        )
+
+                        # Always show stdout if present
+                        if result.stdout:
+                            logger.info(f"Command stdout:\n{result.stdout}")
+
+                        # Always show stderr if present
+                        if result.stderr:
+                            logger.info(f"Command stderr:\n{result.stderr}")
+
+                        if result.returncode == 0:
+                            logger.info("Post-execution command completed successfully (exit code 0)")
+                        else:
+                            logger.error(f"Post-execution command failed with exit code {result.returncode}")
+
+                        logger.info("=" * 60)
+                    except subprocess.TimeoutExpired:
+                        logger.error("Post-execution command timed out after 30 seconds")
+                        logger.info("=" * 60)
+                    except Exception as e:
+                        logger.error(f"Error running post-execution command: {e}")
+                        logger.info("=" * 60)
+
+                logger.info(f"Running post-execution clear pattern: {clear_file_path}")
                 state.is_clearing = True
                 await _execute_pattern_internal(clear_file_path)
                 state.is_clearing = False
-                # Reset skip flag after clear pattern (if user skipped clear, continue to main)
+                # Reset skip flag after clear pattern (if user skipped clear, continue to next)
                 state.skip_requested = False
 
         # Check if stopped during clear pattern
@@ -1471,9 +1588,6 @@ async def run_theta_rho_file(file_path, is_playlist=False, clear_pattern=None, c
                 state.current_playing_file = None
                 state.execution_progress = None
             return
-
-        # Run the main pattern
-        await _execute_pattern_internal(file_path)
 
         # Only clear state if not part of a playlist
         if not is_playlist:
@@ -1732,6 +1846,15 @@ async def stop_actions(clear_playlist = True, wait_for_lock = True):
                 if progress_update_task and not progress_update_task.done():
                     progress_update_task.cancel()
 
+                # Cancel actual position tracking task if running
+                if state.actual_position_tracking_task and not state.actual_position_tracking_task.done():
+                    state.actual_position_tracking_task.cancel()
+                    try:
+                        await state.actual_position_tracking_task
+                    except asyncio.CancelledError:
+                        pass
+                    logger.info("Stopped actual position tracking task")
+
                 # Cancel the playlist task itself (late import to avoid circular dependency)
                 from modules.core import playlist_manager
                 await playlist_manager.cancel_current_playlist()
@@ -1799,6 +1922,57 @@ async def stop_actions(clear_playlist = True, wait_for_lock = True):
         except Exception as update_err:
             logger.error(f"Error updating machine position on error: {update_err}")
         return False
+
+def machine_to_polar(machine_x: float, machine_y: float, reference_theta: float, reference_rho: float,
+                     reference_machine_x: float, reference_machine_y: float) -> tuple[float, float]:
+    """
+    Convert machine X/Y coordinates back to polar theta/rho coordinates.
+
+    This is the inverse of the forward conversion in _move_polar_sync().
+    Note: This is an approximation that ignores the gear offset correction term
+    for simplicity. For most patterns, this provides sufficient accuracy.
+
+    Args:
+        machine_x: Current machine X position
+        machine_y: Current machine Y position
+        reference_theta: Theta at reference point (typically pattern start)
+        reference_rho: Rho at reference point (typically pattern start)
+        reference_machine_x: Machine X at reference point
+        reference_machine_y: Machine Y at reference point
+
+    Returns:
+        tuple: (theta, rho) polar coordinates
+    """
+    # Get scaling factors based on table type
+    if state.table_type == 'dune_weaver_mini':
+        x_scaling_factor = 2
+        y_scaling_factor = 3.7
+    else:
+        x_scaling_factor = 2
+        y_scaling_factor = 5
+
+    # Calculate machine position deltas
+    x_increment = machine_x - reference_machine_x
+    y_increment = machine_y - reference_machine_y
+
+    # Reverse the forward conversion (approximation, ignoring offset term)
+    # Forward: x_increment = delta_theta * 100 / (2 * pi * x_scaling_factor)
+    # Reverse: delta_theta = x_increment * (2 * pi * x_scaling_factor) / 100
+    delta_theta = x_increment * (2 * pi * x_scaling_factor) / 100
+
+    # Forward: y_increment = delta_rho * 100 / y_scaling_factor (+ offset)
+    # Reverse: delta_rho = y_increment * y_scaling_factor / 100 (ignoring offset)
+    delta_rho = y_increment * y_scaling_factor / 100
+
+    # Calculate absolute position
+    actual_theta = reference_theta + delta_theta
+    actual_rho = reference_rho + delta_rho
+
+    # Clamp rho to valid range [0, 1]
+    actual_rho = max(0.0, min(1.0, actual_rho))
+
+    return actual_theta, actual_rho
+
 
 async def move_polar(theta, rho, speed=None):
     """
@@ -1894,6 +2068,12 @@ def set_speed(new_speed):
 
 def get_status():
     """Get the current status of pattern execution."""
+    # Determine the effective speed for the currently running pattern
+    effective_speed = state.speed
+    if state.current_playing_file and is_clear_pattern(state.current_playing_file):
+        if state.clear_pattern_speed is not None:
+            effective_speed = state.clear_pattern_speed
+
     status = {
         "current_file": state.current_playing_file,
         "is_paused": state.pause_requested or is_in_scheduled_pause_period(),
@@ -1905,12 +2085,17 @@ def get_status():
         "is_clearing": state.is_clearing,
         "progress": None,
         "playlist": None,
-        "speed": state.speed,
+        "speed": effective_speed,
+        "base_speed": state.speed,
+        "clear_pattern_speed": state.clear_pattern_speed,
         "pause_time_remaining": state.pause_time_remaining,
         "original_pause_time": getattr(state, 'original_pause_time', None),
         "connection_status": state.conn.is_connected() if state.conn else False,
         "current_theta": state.current_theta,
-        "current_rho": state.current_rho
+        "current_rho": state.current_rho,
+        "actual_theta": state.actual_theta,
+        "actual_rho": state.actual_rho,
+        "enable_actual_position_tracking": state.enable_actual_position_tracking
     }
     
     # Add playlist information if available
@@ -1945,11 +2130,61 @@ def get_status():
         # Add historical execution time if available for this pattern at current speed
         if state.current_playing_file:
             pattern_name = os.path.basename(state.current_playing_file)
-            historical_time = get_last_completed_execution_time(pattern_name, state.speed)
+            historical_time = get_last_completed_execution_time(pattern_name, effective_speed)
             if historical_time:
                 status["progress"]["last_completed_time"] = historical_time
 
     return status
+
+async def actual_position_tracker():
+    """
+    Background task to track actual ball position from FluidNC.
+
+    Polls FluidNC for real machine position, converts to theta/rho coordinates,
+    and updates state for real-time preview display. Runs during pattern execution
+    when state.enable_actual_position_tracking is True.
+    """
+    from modules.connection import connection_manager
+
+    logger.info("Starting actual position tracking task")
+
+    while state.enable_actual_position_tracking and state.current_playing_file:
+        try:
+            # Check if we're connected
+            if not (state.conn and state.conn.is_connected()):
+                await asyncio.sleep(0.2)
+                continue
+
+            # Query machine position from FluidNC
+            machine_pos = await asyncio.to_thread(connection_manager.get_machine_position, 1)  # 1 second timeout
+
+            if machine_pos and machine_pos[0] is not None and machine_pos[1] is not None:
+                machine_x, machine_y = machine_pos
+
+                # Convert machine position to polar coordinates
+                actual_theta, actual_rho = machine_to_polar(
+                    machine_x, machine_y,
+                    state.reference_theta, state.reference_rho,
+                    state.reference_machine_x, state.reference_machine_y
+                )
+
+                # Update state (this will trigger WebSocket broadcast)
+                state.actual_theta = actual_theta
+                state.actual_rho = actual_rho
+
+                logger.debug(f"Actual position: θ={actual_theta:.3f}, ρ={actual_rho:.3f} "
+                           f"(machine X={machine_x:.2f}, Y={machine_y:.2f})")
+
+            # Poll every 200ms (5 times per second)
+            await asyncio.sleep(0.2)
+
+        except Exception as e:
+            logger.error(f"Error in actual position tracker: {e}")
+            await asyncio.sleep(0.5)  # Back off on error
+
+    logger.info("Actual position tracking task stopped")
+    state.actual_position_tracking_task = None
+
 
 async def broadcast_progress():
     """Background task to broadcast progress updates."""

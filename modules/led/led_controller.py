@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 class LEDController:
     def __init__(self, ip_address: Optional[str] = None):
         self.ip_address = ip_address
+        self._saved_state: Optional[Dict] = None
 
     def _get_base_url(self) -> str:
         """Get base URL for WLED JSON API"""
@@ -210,6 +211,38 @@ class LEDController:
         logger.debug(response)
         return response
 
+    def save_state(self) -> bool:
+        """Save current WLED state to restore later"""
+        try:
+            url = self._get_base_url()
+            response = requests.get(f"{url}/state", timeout=2)
+            response.raise_for_status()
+            self._saved_state = response.json()
+            logger.info(f"Saved WLED state: on={self._saved_state.get('on')}, bri={self._saved_state.get('bri')}, ps={self._saved_state.get('ps', -1)}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save WLED state: {e}")
+            self._saved_state = None
+            return False
+
+    def restore_state(self) -> bool:
+        """Restore previously saved WLED state"""
+        if self._saved_state is None:
+            logger.warning("No saved WLED state to restore")
+            return False
+
+        try:
+            url = self._get_base_url()
+            # Restore the full state
+            response = requests.post(f"{url}/state", json=self._saved_state, timeout=2)
+            response.raise_for_status()
+            logger.info(f"Restored WLED state: on={self._saved_state.get('on')}, bri={self._saved_state.get('bri')}, ps={self._saved_state.get('ps', -1)}")
+            self._saved_state = None  # Clear saved state after restore
+            return True
+        except Exception as e:
+            logger.error(f"Failed to restore WLED state: {e}")
+            return False
+
 def effect_loading(led_controller: LEDController):
     res = led_controller.set_effect(47, hex='#ffa000', hex2='#000000', palette=0, speed=150, intensity=150)
     if res.get('is_on', False):
@@ -228,7 +261,8 @@ def effect_connected(led_controller: LEDController):
     time.sleep(0.5)
     res = led_controller.set_effect(0, hex='#08ff00', brightness=100)
     time.sleep(1)
-    effect_idle(led_controller)
+    # Restore previous state instead of going to idle
+    led_controller.restore_state()
     if res.get('is_on', False):
         return True
     else:

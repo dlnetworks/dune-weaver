@@ -1,10 +1,67 @@
-import { defineConfig } from 'vite'
+import { defineConfig, createLogger } from 'vite'
 import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
 import path from 'path'
+import fs from 'fs'
+
+// Read backend API configuration from main.py
+function getBackendConfig(): { host: string; port: number } {
+  try {
+    const mainPyPath = path.join(__dirname, '..', 'main.py')
+    const content = fs.readFileSync(mainPyPath, 'utf-8')
+
+    // Look for uvicorn.run with host and port
+    const hostMatch = content.match(/uvicorn\.run\([^)]*host\s*=\s*["']([^"']+)["']/)
+    const portMatch = content.match(/uvicorn\.run\([^)]*port\s*=\s*(\d+)/)
+
+    if (hostMatch && portMatch) {
+      let host = hostMatch[1]
+      const port = parseInt(portMatch[1])
+
+      // If backend binds to 0.0.0.0, frontend should connect to 127.0.0.1
+      if (host === '0.0.0.0') {
+        host = '127.0.0.1'
+      }
+
+      console.log(`Read backend config from main.py: ${host}:${port}`)
+      return { host, port }
+    }
+  } catch (err) {
+    console.warn('Could not read backend config from main.py:', err)
+  }
+
+  // Fallback to defaults
+  console.log('Using fallback backend config: 127.0.0.1:8080')
+  return { host: '127.0.0.1', port: 8080 }
+}
+
+const backendConfig = getBackendConfig()
+
+// Backend API configuration - can be overridden via environment variables
+// VITE_API_HOST and VITE_API_PORT take precedence over auto-detected values
+const API_HOST = process.env.VITE_API_HOST || backendConfig.host
+const API_PORT = parseInt(process.env.VITE_API_PORT || backendConfig.port.toString())
+const API_BASE_HTTP = `http://${API_HOST}:${API_PORT}`
+const API_BASE_WS = `ws://${API_HOST}:${API_PORT}`
+
+// Create custom logger that filters network messages
+const logger = createLogger()
+const originalInfo = logger.info
+logger.info = (msg, options) => {
+  // Filter out unwanted network address messages
+  if (msg.includes('➜  Local:') || msg.includes('➜  Network:')) {
+    // Only show the configured IP
+    if (!msg.includes(API_HOST)) {
+      return
+    }
+  }
+  originalInfo(msg, options)
+}
 
 // https://vite.dev/config/
 export default defineConfig({
+  clearScreen: false,
+  customLogger: logger,
   plugins: [
     react(),
     VitePWA({
@@ -67,12 +124,13 @@ export default defineConfig({
   },
   server: {
     port: parseInt(process.env.PORT || '5173'),
-    host: true, // Listen on all interfaces (0.0.0.0) for mobile/network access
+    host: API_HOST, // Listen only on specific IP
+    strictPort: true,
     allowedHosts: true, // Allow all hosts for local network development
     proxy: {
       // WebSocket endpoints
       '/ws': {
-        target: 'ws://localhost:8080',
+        target: API_BASE_WS,
         ws: true,
         // Suppress connection errors (common during backend restarts)
         configure: (proxy, _options) => {
@@ -112,56 +170,56 @@ export default defineConfig({
         },
       },
       // All /api endpoints
-      '/api': 'http://localhost:8080',
+      '/api': API_BASE_HTTP,
       // Static assets
-      '/static': 'http://localhost:8080',
+      '/static': API_BASE_HTTP,
       // Preview images
-      '/preview': 'http://localhost:8080',
+      '/preview': API_BASE_HTTP,
       // Legacy root-level API endpoints (for backwards compatibility)
       // Pattern execution
-      '/send_home': 'http://localhost:8080',
-      '/send_coordinate': 'http://localhost:8080',
-      '/stop_execution': 'http://localhost:8080',
-      '/force_stop': 'http://localhost:8080',
-      '/soft_reset': 'http://localhost:8080',
-      '/controller_restart': 'http://localhost:8080',
-      '/pause_execution': 'http://localhost:8080',
-      '/resume_execution': 'http://localhost:8080',
-      '/skip_pattern': 'http://localhost:8080',
-      '/reorder_playlist': 'http://localhost:8080',
-      '/add_to_queue': 'http://localhost:8080',
-      '/run_theta_rho': 'http://localhost:8080',
-      '/run_playlist': 'http://localhost:8080',
+      '/send_home': API_BASE_HTTP,
+      '/send_coordinate': API_BASE_HTTP,
+      '/stop_execution': API_BASE_HTTP,
+      '/force_stop': API_BASE_HTTP,
+      '/soft_reset': API_BASE_HTTP,
+      '/controller_restart': API_BASE_HTTP,
+      '/pause_execution': API_BASE_HTTP,
+      '/resume_execution': API_BASE_HTTP,
+      '/skip_pattern': API_BASE_HTTP,
+      '/reorder_playlist': API_BASE_HTTP,
+      '/add_to_queue': API_BASE_HTTP,
+      '/run_theta_rho': API_BASE_HTTP,
+      '/run_playlist': API_BASE_HTTP,
       // Movement
-      '/move_to_center': 'http://localhost:8080',
-      '/move_to_perimeter': 'http://localhost:8080',
+      '/move_to_center': API_BASE_HTTP,
+      '/move_to_perimeter': API_BASE_HTTP,
       // Speed
-      '/set_speed': 'http://localhost:8080',
+      '/set_speed': API_BASE_HTTP,
       // Connection
-      '/serial_status': 'http://localhost:8080',
-      '/list_serial_ports': 'http://localhost:8080',
-      '/connect': 'http://localhost:8080',
-      '/disconnect': 'http://localhost:8080',
-      '/recover_sensor_homing': 'http://localhost:8080',
+      '/serial_status': API_BASE_HTTP,
+      '/list_serial_ports': API_BASE_HTTP,
+      '/connect': API_BASE_HTTP,
+      '/disconnect': API_BASE_HTTP,
+      '/recover_sensor_homing': API_BASE_HTTP,
       // Patterns
-      '/list_theta_rho_files': 'http://localhost:8080',
-      '/list_theta_rho_files_with_metadata': 'http://localhost:8080',
-      '/preview_thr': 'http://localhost:8080',
-      '/preview_thr_batch': 'http://localhost:8080',
-      '/get_theta_rho_coordinates': 'http://localhost:8080',
-      '/delete_theta_rho_file': 'http://localhost:8080',
-      '/upload_theta_rho': 'http://localhost:8080',
+      '/list_theta_rho_files': API_BASE_HTTP,
+      '/list_theta_rho_files_with_metadata': API_BASE_HTTP,
+      '/preview_thr': API_BASE_HTTP,
+      '/preview_thr_batch': API_BASE_HTTP,
+      '/get_theta_rho_coordinates': API_BASE_HTTP,
+      '/delete_theta_rho_file': API_BASE_HTTP,
+      '/upload_theta_rho': API_BASE_HTTP,
       // Playlists
-      '/list_all_playlists': 'http://localhost:8080',
-      '/get_playlist': 'http://localhost:8080',
-      '/create_playlist': 'http://localhost:8080',
-      '/modify_playlist': 'http://localhost:8080',
-      '/delete_playlist': 'http://localhost:8080',
-      '/rename_playlist': 'http://localhost:8080',
-      '/add_to_playlist': 'http://localhost:8080',
+      '/list_all_playlists': API_BASE_HTTP,
+      '/get_playlist': API_BASE_HTTP,
+      '/create_playlist': API_BASE_HTTP,
+      '/modify_playlist': API_BASE_HTTP,
+      '/delete_playlist': API_BASE_HTTP,
+      '/rename_playlist': API_BASE_HTTP,
+      '/add_to_playlist': API_BASE_HTTP,
       // LED
-      '/get_led_config': 'http://localhost:8080',
-      '/set_led_config': 'http://localhost:8080',
+      '/get_led_config': API_BASE_HTTP,
+      '/set_led_config': API_BASE_HTTP,
     },
   },
   build: {

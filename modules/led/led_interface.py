@@ -64,7 +64,7 @@ class LEDInterface:
         if self._controller and hasattr(self._controller, 'stop'):
             try:
                 self._controller.stop()
-            except:
+            except Exception:
                 pass
 
         if provider == "wled" and ip_address:
@@ -148,6 +148,26 @@ class LEDInterface:
     def get_controller(self):
         """Get the underlying controller instance (for advanced usage)"""
         return self._controller
+
+    def save_state(self) -> bool:
+        """Save current LED state (only for WLED)"""
+        if not self.is_configured:
+            return False
+
+        if self.provider == "wled":
+            return self._controller.save_state()
+        # DW LEDs don't need state saving (they're local effects)
+        return False
+
+    def restore_state(self) -> bool:
+        """Restore previously saved LED state (only for WLED)"""
+        if not self.is_configured:
+            return False
+
+        if self.provider == "wled":
+            return self._controller.restore_state()
+        # DW LEDs don't need state restoring
+        return False
 
     # Async versions of methods for non-blocking calls from async context
     # These use asyncio.to_thread() to avoid blocking the event loop

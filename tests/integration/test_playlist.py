@@ -205,7 +205,7 @@ class TestPlaylistModes:
             # Playlist should be running
             assert state.current_playlist is not None
 
-            print(f"Playlist running with shuffle enabled")
+            print("Playlist running with shuffle enabled")
             print(f"Current pattern: {state.current_playing_file}")
             print(f"Playlist order: {state.current_playlist}")
 
@@ -518,7 +518,7 @@ class TestWebSocketStatus:
                 print(f"WebSocket status: {data}")
 
                 # Should have expected status fields
-                assert "is_running" in data, f"Expected 'is_running' in data"
+                assert "is_running" in data, "Expected 'is_running' in data"
 
             # Clean up
             stop_pattern(client)

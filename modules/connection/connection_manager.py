@@ -153,14 +153,73 @@ class WebSocketConnection(BaseConnection):
 
     def readline(self) -> str:
         with self.lock:
-            data = self.ws.recv()
-            # Decode bytes to string if necessary
-            if isinstance(data, bytes):
-                data = data.decode('utf-8')
-            return data.strip()
+            # Store status responses to return them when specifically queried
+            if not hasattr(self, '_status_buffer'):
+                self._status_buffer = []
+
+            while True:
+                data = self.ws.recv()
+                # Decode bytes to string if necessary
+                if isinstance(data, bytes):
+                    data = data.decode('utf-8')
+                data = data.strip()
+
+                # Filter out WebSocket PING messages (FluidNC keep-alive)
+                if data.startswith('PING:'):
+                    logger.debug(f'Filtering out WebSocket PING: {data}')
+                    continue
+
+                # Status responses (from ? queries) should be buffered and only returned
+                # when we're actually expecting them. Otherwise, filter them out.
+                if data.startswith('<') and ('|MPos:' in data or '|WPos:' in data):
+                    # This is a status response - buffer it for status queries
+                    self._status_buffer.append(data)
+                    logger.debug(f'Buffered status response: {data}')
+                    # If we have too many buffered, keep only the latest
+                    if len(self._status_buffer) > 5:
+                        self._status_buffer = self._status_buffer[-5:]
+                    continue
+
+                return data
 
     def in_waiting(self) -> int:
         return 0  # Not applicable for WebSocket
+
+    def readline_nowait(self, timeout=0.5):
+        """
+        Read a line with timeout, for use in initialization/query functions.
+        Returns None if no data available within timeout.
+        """
+        import select
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                # Check if data is available using select with short timeout
+                ready = select.select([self.ws.sock], [], [], 0.01)
+                if ready[0]:
+                    data = self.ws.recv()
+                    if isinstance(data, bytes):
+                        data = data.decode('utf-8')
+                    data = data.strip()
+
+                    # Filter out PING messages
+                    if data.startswith('PING:'):
+                        continue
+
+                    # For initialization queries, buffer status responses but also return them
+                    # This is different from pattern execution where we filter them completely
+                    if data.startswith('<') and ('|MPos:' in data or '|WPos:' in data):
+                        if not hasattr(self, '_status_buffer'):
+                            self._status_buffer = []
+                        self._status_buffer.append(data)
+                        if len(self._status_buffer) > 5:
+                            self._status_buffer = self._status_buffer[-5:]
+                        return data  # Return status responses during initialization
+
+                    return data
+            except Exception:
+                pass
+        return None
 
     def is_connected(self) -> bool:
         return self.ws is not None
@@ -281,40 +340,64 @@ def connect_device(homing=True):
         state.led_controller = None
     # For other cases (e.g., wled without IP), preserve existing controller
 
+    # Save current LED state before showing connection animations (if enabled)
+    if state.led_controller and state.wled_restore_state_on_connect:
+        state.led_controller.save_state()
+
     # Show loading effect
     if state.led_controller:
         state.led_controller.effect_loading()
 
-    ports = list_serial_ports()
-
-    # Check auto-connect mode: "__auto__" or None = auto, "__none__" = disabled, else specific port
-    if state.preferred_port == "__none__":
+    # Check if auto-connect is enabled
+    if not state.auto_connect_enabled:
         logger.info("Auto-connect disabled by user preference")
         # Skip all auto-connect logic, no connection will be established
-    # Priority for auto-connect:
-    # 1. Preferred port (user's explicit choice) if available
-    # 2. Last used port if available
-    # 3. First available port as fallback
-    elif state.preferred_port and state.preferred_port not in ("__auto__", None) and state.preferred_port in ports:
-        logger.info(f"Connecting to preferred port: {state.preferred_port}")
-        state.conn = SerialConnection(state.preferred_port)
-    elif state.port and state.port in ports:
-        logger.info(f"Connecting to last used port: {state.port}")
-        state.conn = SerialConnection(state.port)
-    elif ports:
-        # Prefer non-deprioritized ports (e.g., USB serial over hardware UART)
-        preferred_ports = [p for p in ports if p not in DEPRIORITIZED_PORTS]
-        fallback_ports = [p for p in ports if p in DEPRIORITIZED_PORTS]
+    # Check default connection method
+    elif state.default_connection_method == 'websocket':
+        try:
+            ws_url = f'ws://{state.websocket_host}:{state.websocket_port}'
+            logger.info(f"Auto-connecting to WebSocket: {ws_url}")
+            state.conn = WebSocketConnection(ws_url)
+        except Exception as e:
+            logger.error(f"Failed to auto-connect via WebSocket to {ws_url}: {e}")
+            state.conn = None
+    # Serial connection auto-connect logic
+    elif state.default_connection_method == 'serial':
+        ports = list_serial_ports()
 
-        if preferred_ports:
-            logger.info(f"Connecting to first available port: {preferred_ports[0]}")
-            state.conn = SerialConnection(preferred_ports[0])
-        elif fallback_ports:
-            logger.info(f"Connecting to deprioritized port (no better option): {fallback_ports[0]}")
-            state.conn = SerialConnection(fallback_ports[0])
+        # Priority for auto-connect:
+        # 1. Preferred port (user's explicit choice) if available
+        # 2. Last used port if available
+        # 3. First available port as fallback
+        if state.preferred_port and state.preferred_port in ports:
+            logger.info(f"Connecting to preferred port: {state.preferred_port}")
+            state.conn = SerialConnection(state.preferred_port)
+        elif state.port and state.port in ports:
+            logger.info(f"Connecting to last used port: {state.port}")
+            state.conn = SerialConnection(state.port)
+        elif ports:
+            # Prefer non-deprioritized ports (e.g., USB serial over hardware UART)
+            preferred_ports = [p for p in ports if p not in DEPRIORITIZED_PORTS]
+            fallback_ports = [p for p in ports if p in DEPRIORITIZED_PORTS]
+
+            if preferred_ports:
+                logger.info(f"Connecting to first available port: {preferred_ports[0]}")
+                state.conn = SerialConnection(preferred_ports[0])
+            elif fallback_ports:
+                logger.info(f"Connecting to deprioritized port (no better option): {fallback_ports[0]}")
+                state.conn = SerialConnection(fallback_ports[0])
+        else:
+            logger.error("Auto connect failed: No serial ports available")
     else:
-        logger.error("Auto connect failed: No serial ports available")
-        # state.conn = WebSocketConnection('ws://fluidnc.local:81')
+        # Fallback for older configs without default_connection_method set
+        logger.warning(f"Unknown default_connection_method: {state.default_connection_method}, defaulting to serial")
+        state.default_connection_method = 'serial'  # Set for next time
+        ports = list_serial_ports()
+        if ports:
+            preferred_ports = [p for p in ports if p not in DEPRIORITIZED_PORTS]
+            if preferred_ports:
+                logger.info(f"Connecting to first available port: {preferred_ports[0]}")
+                state.conn = SerialConnection(preferred_ports[0])
 
     if (state.conn.is_connected() if state.conn else False):
         # Check for alarm state and unlock if needed before initializing
@@ -324,13 +407,17 @@ def connect_device(homing=True):
 
         device_init(homing)
 
-    # Show connected effect, then transition to configured idle effect
+    # Show connected effect
     if state.led_controller:
-        logger.info("Showing LED connected effect (green flash)")
-        state.led_controller.effect_connected()
-        # Set the configured idle effect after connection
-        logger.info(f"Setting LED to idle effect: {state.dw_led_idle_effect}")
-        state.led_controller.effect_idle(state.dw_led_idle_effect)
+        if state.wled_restore_state_on_connect:
+            logger.info("Showing LED connected effect (green flash, then restoring previous state)")
+            state.led_controller.effect_connected()
+        else:
+            logger.info("Showing LED connected effect (green flash, then transitioning to idle)")
+            state.led_controller.effect_connected()
+            # If restore is disabled, transition to idle instead
+            state.led_controller.effect_idle(state.dw_led_idle_effect)
+        # Start idle timeout if configured (will activate after timeout period)
         _start_idle_led_timeout()
 
 def check_and_unlock_alarm():
@@ -344,9 +431,14 @@ def check_and_unlock_alarm():
     try:
         logger.info("Checking device status for alarm state...")
 
-        # Clear any pending data in buffer first
-        while state.conn.in_waiting() > 0:
-            state.conn.readline()
+        # For WebSocket, clear the status buffer
+        if isinstance(state.conn, WebSocketConnection):
+            if hasattr(state.conn, '_status_buffer'):
+                state.conn._status_buffer.clear()
+        else:
+            # Clear any pending data in serial buffer first
+            while state.conn.in_waiting() > 0:
+                state.conn.readline()
 
         # Send status query
         state.conn.send('?\n')
@@ -356,13 +448,24 @@ def check_and_unlock_alarm():
         max_attempts = 10
         response = None
 
-        for attempt in range(max_attempts):
-            if state.conn.in_waiting() > 0:
-                response = state.conn.readline()
-                logger.debug(f"Status response: {response}")
-                if response and ('<' in response or 'Alarm' in response or 'Idle' in response):
-                    break  # Got a valid status response
-            time.sleep(0.1)
+        if isinstance(state.conn, WebSocketConnection):
+            # For WebSocket, actively read the response
+            for attempt in range(max_attempts):
+                response = state.conn.readline_nowait(timeout=0.2)
+                if response:
+                    logger.debug(f"Status response: {response}")
+                    if '<' in response or 'Alarm' in response or 'Idle' in response:
+                        break  # Got a valid status response
+                time.sleep(0.1)
+        else:
+            # Serial connection
+            for attempt in range(max_attempts):
+                if state.conn.in_waiting() > 0:
+                    response = state.conn.readline()
+                    logger.debug(f"Status response: {response}")
+                    if response and ('<' in response or 'Alarm' in response or 'Idle' in response):
+                        break  # Got a valid status response
+                time.sleep(0.1)
 
         if not response:
             logger.warning("No status response received, proceeding anyway")
@@ -378,22 +481,35 @@ def check_and_unlock_alarm():
             time.sleep(1.0)  # Give more time for unlock to process
 
             # Clear buffer before verification
-            while state.conn.in_waiting() > 0:
-                discarded = state.conn.readline()
-                logger.debug(f"Discarded response: {discarded}")
+            if isinstance(state.conn, WebSocketConnection):
+                if hasattr(state.conn, '_status_buffer'):
+                    state.conn._status_buffer.clear()
+            else:
+                while state.conn.in_waiting() > 0:
+                    discarded = state.conn.readline()
+                    logger.debug(f"Discarded response: {discarded}")
 
             # Verify unlock succeeded
             state.conn.send('?\n')
             time.sleep(0.3)
 
             verify_response = None
-            for attempt in range(max_attempts):
-                if state.conn.in_waiting() > 0:
-                    verify_response = state.conn.readline()
-                    logger.debug(f"Verification response: {verify_response}")
-                    if verify_response and '<' in verify_response:
-                        break
-                time.sleep(0.1)
+            if isinstance(state.conn, WebSocketConnection):
+                for attempt in range(max_attempts):
+                    verify_response = state.conn.readline_nowait(timeout=0.2)
+                    if verify_response:
+                        logger.debug(f"Verification response: {verify_response}")
+                        if '<' in verify_response:
+                            break
+                    time.sleep(0.1)
+            else:
+                for attempt in range(max_attempts):
+                    if state.conn.in_waiting() > 0:
+                        verify_response = state.conn.readline()
+                        logger.debug(f"Verification response: {verify_response}")
+                        if verify_response and '<' in verify_response:
+                            break
+                    time.sleep(0.1)
 
             if verify_response and "Alarm" in verify_response:
                 # Check if pins are physically triggered (Pn: in response)
@@ -425,18 +541,33 @@ def get_status_response() -> str:
         logger.warning("Cannot get status response: no active connection")
         return False
 
-    while True:
+    max_attempts = 3
+    for attempt in range(max_attempts):
         try:
             state.conn.send('?')
-            response = state.conn.readline()
-            # Accept either MPos or WPos format (depends on GRBL $10 setting)
-            if "MPos" in response or "WPos" in response:
-                logger.debug(f"Status response: {response}")
-                return response
+
+            if isinstance(state.conn, WebSocketConnection):
+                # For WebSocket, actively read the response
+                response = state.conn.readline_nowait(timeout=0.5)
+                if response and ("MPos" in response or "WPos" in response):
+                    logger.debug(f"Status response: {response}")
+                    return response
+            else:
+                # Serial connection - use normal readline
+                time.sleep(0.1)
+                response = state.conn.readline()
+                # Accept either MPos or WPos format (depends on GRBL $10 setting)
+                if response and ("MPos" in response or "WPos" in response):
+                    logger.debug(f"Status response: {response}")
+                    return response
         except Exception as e:
-            logger.error(f"Error getting status response: {e}")
-            return False
-        time.sleep(1)
+            logger.error(f"Error getting status response (attempt {attempt + 1}/{max_attempts}): {e}")
+            if attempt == max_attempts - 1:
+                return False
+
+        time.sleep(0.2)
+
+    return False
         
 def parse_machine_position(response: str):
     """
@@ -557,8 +688,12 @@ def _detect_firmware():
 
     # Clear buffer first
     try:
-        while state.conn.in_waiting() > 0:
-            state.conn.readline()
+        if isinstance(state.conn, WebSocketConnection):
+            if hasattr(state.conn, '_status_buffer'):
+                state.conn._status_buffer.clear()
+        else:
+            while state.conn.in_waiting() > 0:
+                state.conn.readline()
     except Exception:
         pass
 
@@ -571,39 +706,49 @@ def _detect_firmware():
         start_time = time.time()
 
         while time.time() - start_time < 2.0:
-            if state.conn.in_waiting() > 0:
-                response = state.conn.readline()
-                if response:
-                    logger.debug(f"Firmware detection response: {response}")
-                    response_lower = response.lower()
+            response = None
+            if isinstance(state.conn, WebSocketConnection):
+                response = state.conn.readline_nowait(timeout=0.1)
+            else:
+                if state.conn.in_waiting() > 0:
+                    response = state.conn.readline()
 
-                    if 'fluidnc' in response_lower:
-                        firmware_type = 'fluidnc'
-                        # Try to extract version from response like "FluidNC v3.7.2"
-                        if 'v' in response_lower:
-                            parts = response.split()
-                            for part in parts:
-                                if part.lower().startswith('v') and any(c.isdigit() for c in part):
-                                    version = part
-                                    break
-                        break
-                    elif 'grbl' in response_lower and 'fluidnc' not in response_lower:
-                        firmware_type = 'grbl'
-                        # Try to extract version like "Grbl 1.1h"
+            if response:
+                logger.debug(f"Firmware detection response: {response}")
+                response_lower = response.lower()
+
+                if 'fluidnc' in response_lower:
+                    firmware_type = 'fluidnc'
+                    # Try to extract version from response like "FluidNC v3.7.2"
+                    if 'v' in response_lower:
                         parts = response.split()
-                        for i, part in enumerate(parts):
-                            if 'grbl' in part.lower() and i + 1 < len(parts):
-                                version = parts[i + 1]
+                        for part in parts:
+                            if part.lower().startswith('v') and any(c.isdigit() for c in part):
+                                version = part
                                 break
-                        break
-                    elif response.lower().strip() == 'ok':
-                        break
+                    break
+                elif 'grbl' in response_lower and 'fluidnc' not in response_lower:
+                    firmware_type = 'grbl'
+                    # Try to extract version like "Grbl 1.1h"
+                    parts = response.split()
+                    for i, part in enumerate(parts):
+                        if 'grbl' in part.lower() and i + 1 < len(parts):
+                            version = parts[i + 1]
+                            break
+                    break
+                elif response.lower().strip() == 'ok':
+                    break
             else:
                 time.sleep(0.05)
 
         # Clear any remaining responses
-        while state.conn.in_waiting() > 0:
-            state.conn.readline()
+        if isinstance(state.conn, WebSocketConnection):
+            # Drain any remaining WebSocket messages
+            while state.conn.readline_nowait(timeout=0.05):
+                pass
+        else:
+            while state.conn.in_waiting() > 0:
+                state.conn.readline()
 
         return (firmware_type, version)
 
@@ -766,7 +911,11 @@ def _get_steps_grbl():
 
         while time.time() - attempt_start < attempt_timeout:
             try:
-                response = state.conn.readline()
+                # Use readline_nowait for WebSocket to avoid blocking
+                if isinstance(state.conn, WebSocketConnection):
+                    response = state.conn.readline_nowait(timeout=0.2)
+                else:
+                    response = state.conn.readline()
 
                 if not response:
                     continue
@@ -818,8 +967,13 @@ def _get_steps_grbl():
             logger.warning(f"Attempt {attempt + 1} did not get all settings, retrying...")
             time.sleep(0.5)
             try:
-                while state.conn.in_waiting() > 0:
-                    state.conn.readline()
+                if isinstance(state.conn, WebSocketConnection):
+                    # Drain any remaining WebSocket messages
+                    while state.conn.readline_nowait(timeout=0.05):
+                        pass
+                else:
+                    while state.conn.in_waiting() > 0:
+                        state.conn.readline()
             except Exception:
                 pass
 
@@ -841,8 +995,12 @@ def get_machine_steps(timeout=10):
 
     # Clear any pending data in the buffer
     try:
-        while state.conn.in_waiting() > 0:
-            state.conn.readline()
+        if isinstance(state.conn, WebSocketConnection):
+            if hasattr(state.conn, '_status_buffer'):
+                state.conn._status_buffer.clear()
+        else:
+            while state.conn.in_waiting() > 0:
+                state.conn.readline()
     except Exception as e:
         logger.warning(f"Error clearing buffer: {e}")
 
@@ -852,9 +1010,11 @@ def get_machine_steps(timeout=10):
         time.sleep(0.2)
         ready_check_attempts = 5
         controller_ready = False
-        for _ in range(ready_check_attempts):
-            if state.conn.in_waiting() > 0:
-                response = state.conn.readline()
+
+        if isinstance(state.conn, WebSocketConnection):
+            # For WebSocket, actively read the response
+            for _ in range(ready_check_attempts):
+                response = state.conn.readline_nowait(timeout=0.2)
                 if response and ('<' in response or 'Idle' in response or 'Alarm' in response):
                     controller_ready = True
                     if 'Alarm' in response:
@@ -862,14 +1022,31 @@ def get_machine_steps(timeout=10):
                     else:
                         logger.debug(f"Controller ready, status: {response}")
                     break
-            time.sleep(0.1)
+                time.sleep(0.1)
+        else:
+            # Serial connection
+            for _ in range(ready_check_attempts):
+                if state.conn.in_waiting() > 0:
+                    response = state.conn.readline()
+                    if response and ('<' in response or 'Idle' in response or 'Alarm' in response):
+                        controller_ready = True
+                        if 'Alarm' in response:
+                            logger.info(f"Controller in ALARM state (likely limit switch active), proceeding with settings query: {response.strip()}")
+                        else:
+                            logger.debug(f"Controller ready, status: {response}")
+                        break
+                time.sleep(0.1)
 
         if not controller_ready:
             logger.warning("Controller not responding to status query, proceeding anyway...")
 
         # Clear buffer after readiness check
-        while state.conn.in_waiting() > 0:
-            state.conn.readline()
+        if isinstance(state.conn, WebSocketConnection):
+            if hasattr(state.conn, '_status_buffer'):
+                state.conn._status_buffer.clear()
+        else:
+            while state.conn.in_waiting() > 0:
+                state.conn.readline()
         time.sleep(0.1)
     except Exception as e:
         logger.warning(f"Readiness check failed: {e}, proceeding anyway...")
@@ -1307,22 +1484,39 @@ def get_machine_position(timeout=5):
     Supports both MPos and WPos formats (depends on GRBL $10 setting).
     """
     start_time = time.time()
-    while time.time() - start_time < timeout:
+
+    # Query for position
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        if time.time() - start_time >= timeout:
+            break
+
         try:
             state.conn.send('?')
-            response = state.conn.readline()
-            logger.debug(f"Raw status response: {response}")
-            # Accept either MPos or WPos format
-            if "MPos" in response or "WPos" in response:
-                pos = parse_machine_position(response)
-                if pos:
-                    machine_x, machine_y = pos
-                    logger.debug(f"Machine position: X={machine_x}, Y={machine_y}")
-                    return machine_x, machine_y
+
+            if isinstance(state.conn, WebSocketConnection):
+                # For WebSocket, actively read the response using readline_nowait
+                response = state.conn.readline_nowait(timeout=0.5)
+            else:
+                # For serial, use normal readline
+                time.sleep(0.1)
+                response = state.conn.readline()
+
+            if response:
+                logger.debug(f"Raw status response: {response}")
+                # Accept either MPos or WPos format
+                if "MPos" in response or "WPos" in response:
+                    pos = parse_machine_position(response)
+                    if pos:
+                        machine_x, machine_y = pos
+                        logger.debug(f"Machine position: X={machine_x}, Y={machine_y}")
+                        return machine_x, machine_y
+
         except Exception as e:
-            logger.error(f"Error getting machine position: {e}")
-            return
+            logger.error(f"Error getting machine position (attempt {attempt + 1}/{max_attempts}): {e}")
+
         time.sleep(0.1)
+
     logger.warning("Timeout reached waiting for machine position")
     return None, None
 
@@ -1380,14 +1574,22 @@ def perform_soft_reset_sync(max_retries: int = 5):
             # Clear any pending data first
             if isinstance(state.conn, SerialConnection):
                 state.conn.reset_input_buffer()
+            elif isinstance(state.conn, WebSocketConnection):
+                if hasattr(state.conn, '_status_buffer'):
+                    state.conn._status_buffer.clear()
 
-            # Send appropriate reset command based on firmware
-            if firmware_type == 'fluidnc':
-                # FluidNC uses $Bye for soft reset
+            # Send appropriate reset command based on connection type and firmware
+            # IMPORTANT: For WebSocket, always use Ctrl+X because $Bye closes the connection
+            if isinstance(state.conn, WebSocketConnection):
+                # WebSocket: Use Ctrl+X even for FluidNC to avoid connection closure
+                state.conn.send('\x18')
+                logger.info(f"Ctrl+X (0x18) sent to {state.port} (WebSocket)")
+            elif firmware_type == 'fluidnc':
+                # Serial + FluidNC: Use $Bye for soft reset
                 state.conn.send('$Bye\n')
                 logger.info(f"$Bye sent to {state.port}")
             else:
-                # GRBL uses Ctrl+X (0x18) for soft reset
+                # Serial + GRBL: Use Ctrl+X (0x18) for soft reset
                 state.conn.send('\x18')
                 logger.info(f"Ctrl+X (0x18) sent to {state.port}")
 
@@ -1398,7 +1600,11 @@ def perform_soft_reset_sync(max_retries: int = 5):
             reset_confirmed = False
             while time.time() - start_time < timeout:
                 try:
-                    response = state.conn.readline()
+                    if isinstance(state.conn, WebSocketConnection):
+                        response = state.conn.readline_nowait(timeout=0.1)
+                    else:
+                        response = state.conn.readline()
+
                     if response:
                         logger.debug(f"Reset response: {response}")
                         # Wait for the "Grbl" startup banner - this means fully ready
@@ -1421,7 +1627,11 @@ def perform_soft_reset_sync(max_retries: int = 5):
                 unlock_start = time.time()
                 while time.time() - unlock_start < 1.0:
                     try:
-                        response = state.conn.readline()
+                        if isinstance(state.conn, WebSocketConnection):
+                            response = state.conn.readline_nowait(timeout=0.1)
+                        else:
+                            response = state.conn.readline()
+
                         if response:
                             logger.debug(f"$X response: {response}")
                             if response.lower() == "ok":
@@ -1489,8 +1699,15 @@ def reset_work_coordinates():
 
         # Clear any stale input data first
         try:
-            while state.conn.in_waiting() > 0:
-                state.conn.readline()
+            if isinstance(state.conn, WebSocketConnection):
+                if hasattr(state.conn, '_status_buffer'):
+                    state.conn._status_buffer.clear()
+                # Drain any remaining messages
+                while state.conn.readline_nowait(timeout=0.05):
+                    pass
+            else:
+                while state.conn.in_waiting() > 0:
+                    state.conn.readline()
         except Exception:
             pass
 
@@ -1502,16 +1719,20 @@ def reset_work_coordinates():
         start_time = time.time()
         got_ok = False
         while time.time() - start_time < 2.0:
-            if state.conn.in_waiting() > 0:
+            response = None
+            if isinstance(state.conn, WebSocketConnection):
+                response = state.conn.readline_nowait(timeout=0.1)
+            elif state.conn.in_waiting() > 0:
                 response = state.conn.readline()
-                if response:
-                    logger.debug(f"G92.1 response: {response}")
-                    if response.lower() == "ok":
-                        got_ok = True
-                        break
-                    elif "error" in response.lower():
-                        logger.warning(f"G92.1 error: {response}")
-                        break
+
+            if response:
+                logger.debug(f"G92.1 response: {response}")
+                if response.lower() == "ok":
+                    got_ok = True
+                    break
+                elif "error" in response.lower():
+                    logger.warning(f"G92.1 error: {response}")
+                    break
             time.sleep(0.05)
 
         if not got_ok:
@@ -1525,16 +1746,20 @@ def reset_work_coordinates():
         start_time = time.time()
         got_ok = False
         while time.time() - start_time < 2.0:
-            if state.conn.in_waiting() > 0:
+            response = None
+            if isinstance(state.conn, WebSocketConnection):
+                response = state.conn.readline_nowait(timeout=0.1)
+            elif state.conn.in_waiting() > 0:
                 response = state.conn.readline()
-                if response:
-                    logger.debug(f"G10 response: {response}")
-                    if response.lower() == "ok":
-                        got_ok = True
-                        break
-                    elif "error" in response.lower():
-                        logger.warning(f"G10 error: {response}")
-                        break
+
+            if response:
+                logger.debug(f"G10 response: {response}")
+                if response.lower() == "ok":
+                    got_ok = True
+                    break
+                elif "error" in response.lower():
+                    logger.warning(f"G10 error: {response}")
+                    break
             time.sleep(0.05)
 
         if not got_ok:

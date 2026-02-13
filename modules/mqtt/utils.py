@@ -1,12 +1,10 @@
 """MQTT utilities and callback management."""
-import os
 from typing import Dict, Callable
 from modules.core.pattern_manager import (
     run_theta_rho_file, stop_actions, pause_execution,
-    resume_execution, THETA_RHO_DIR,
-    run_theta_rho_files, list_theta_rho_files
+    resume_execution, list_theta_rho_files
 )
-from modules.core.playlist_manager import get_playlist, run_playlist
+from modules.core.playlist_manager import run_playlist
 from modules.connection.connection_manager import home
 from modules.core.state import state
 

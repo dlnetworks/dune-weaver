@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
@@ -12,6 +12,8 @@ from modules.connection import connection_manager
 from modules.core import pattern_manager
 from modules.core.pattern_manager import parse_theta_rho_file, THETA_RHO_DIR
 from modules.core import playlist_manager
+from modules.core import pattern_duration_cache
+from modules.core import cache_manager
 from modules.update import update_manager
 from modules.core.state import state
 from modules import mqtt
@@ -218,6 +220,30 @@ async def lifespan(app: FastAPI):
     # Start cache check in background immediately
     asyncio.create_task(delayed_cache_check())
 
+    # Initialize pattern duration cache in background
+    async def init_duration_cache():
+        """Initialize duration cache with background calculation."""
+        try:
+            logger.info("Initializing pattern duration cache...")
+            # Use state.speed as the default speed, or fall back to 100
+            default_speed = state.speed if state.speed and state.speed > 0 else 100
+            # Also calculate for clear_pattern_speed if it's different
+            speeds = [default_speed]
+            if state.clear_pattern_speed and state.clear_pattern_speed > 0 and state.clear_pattern_speed != default_speed:
+                speeds.append(state.clear_pattern_speed)
+            logger.info(f"Using ball speeds: {speeds} mm/min for duration calculations")
+            await asyncio.to_thread(
+                pattern_duration_cache.init_duration_cache,
+                pattern_manager.THETA_RHO_DIR,
+                speeds=speeds
+            )
+            logger.info("Pattern duration cache initialization started")
+        except Exception as e:
+            logger.warning(f"Failed to initialize pattern duration cache: {str(e)}")
+
+    # Start duration cache initialization in background
+    asyncio.create_task(init_duration_cache())
+
     # Start idle timeout monitor
     async def idle_timeout_monitor():
         """Monitor LED idle timeout and turn off LEDs when timeout expires."""
@@ -265,6 +291,20 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(idle_timeout_monitor())
 
+    # Background task to broadcast status updates via WebSocket
+    async def status_broadcaster():
+        """Broadcast status updates to connected WebSocket clients."""
+        while True:
+            try:
+                if active_status_connections:
+                    status = pattern_manager.get_status()
+                    await broadcast_status_update(status)
+            except Exception as e:
+                logger.error(f"Error in status broadcaster: {e}")
+            await asyncio.sleep(0.1)  # Broadcast 10 times per second
+
+    asyncio.create_task(status_broadcaster())
+
     yield  # This separates startup from shutdown code
 
     # Shutdown
@@ -301,6 +341,9 @@ def get_preview_semaphore() -> asyncio.Semaphore:
 # Pydantic models for request/response validation
 class ConnectRequest(BaseModel):
     port: Optional[str] = None
+    connection_type: Optional[str] = None  # 'serial' or 'websocket'
+    websocket_host: Optional[str] = None
+    websocket_port: Optional[int] = None
 
 class auto_playModeRequest(BaseModel):
     enabled: bool
@@ -334,6 +377,7 @@ class PlaylistRequest(BaseModel):
     clear_pattern: Optional[str] = None
     run_mode: str = "single"
     shuffle: bool = False
+    start_index: int = 0  # Index to start playback from
 
 class PlaylistRunRequest(BaseModel):
     playlist_name: str
@@ -343,6 +387,7 @@ class PlaylistRunRequest(BaseModel):
     shuffle: Optional[bool] = False
     start_time: Optional[str] = None
     end_time: Optional[str] = None
+    start_index: Optional[int] = 0  # Index to start playback from
 
 class SpeedRequest(BaseModel):
     speed: float
@@ -380,14 +425,24 @@ class GetCoordinatesRequest(BaseModel):
 class AppSettingsUpdate(BaseModel):
     name: Optional[str] = None
     custom_logo: Optional[str] = None  # Filename or empty string to clear (favicon auto-generated)
+    cache_worker_count: Optional[int] = None
 
 class ConnectionSettingsUpdate(BaseModel):
     preferred_port: Optional[str] = None
+    connection_type: Optional[str] = None
+    websocket_host: Optional[str] = None
+    websocket_port: Optional[int] = None
+    auto_connect_enabled: Optional[bool] = None
+    default_connection_method: Optional[str] = None
+    frontend_api_host: Optional[str] = None
+    frontend_api_port: Optional[int] = None
 
 class PatternSettingsUpdate(BaseModel):
     clear_pattern_speed: Optional[int] = None
     custom_clear_from_in: Optional[str] = None
     custom_clear_from_out: Optional[str] = None
+    post_execution_command: Optional[str] = None
+    post_execution_enabled: Optional[bool] = None
 
 class AutoPlaySettingsUpdate(BaseModel):
     enabled: Optional[bool] = None
@@ -426,6 +481,8 @@ class DwLedSettingsUpdate(BaseModel):
 class LedSettingsUpdate(BaseModel):
     provider: Optional[str] = None  # "none", "wled", "dw_leds"
     wled_ip: Optional[str] = None
+    wled_restore_state_on_connect: Optional[bool] = None
+    wled_power_off_on_exit: Optional[bool] = None
     dw_led: Optional[DwLedSettingsUpdate] = None
 
 class MqttSettingsUpdate(BaseModel):
@@ -641,15 +698,25 @@ async def get_all_settings():
     return {
         "app": {
             "name": state.app_name,
-            "custom_logo": state.custom_logo
+            "custom_logo": state.custom_logo,
+            "cache_worker_count": state.cache_worker_count
         },
         "connection": {
-            "preferred_port": state.preferred_port
+            "preferred_port": state.preferred_port,
+            "connection_type": state.connection_type,
+            "websocket_host": state.websocket_host,
+            "websocket_port": state.websocket_port,
+            "auto_connect_enabled": state.auto_connect_enabled,
+            "default_connection_method": state.default_connection_method,
+            "frontend_api_host": state.frontend_api_host,
+            "frontend_api_port": state.frontend_api_port
         },
         "patterns": {
             "clear_pattern_speed": state.clear_pattern_speed,
             "custom_clear_from_in": state.custom_clear_from_in,
-            "custom_clear_from_out": state.custom_clear_from_out
+            "custom_clear_from_out": state.custom_clear_from_out,
+            "post_execution_command": state.post_execution_command,
+            "post_execution_enabled": state.post_execution_enabled
         },
         "auto_play": {
             "enabled": state.auto_play_enabled,
@@ -677,6 +744,8 @@ async def get_all_settings():
         "led": {
             "provider": state.led_provider,
             "wled_ip": state.wled_ip,
+            "wled_restore_state_on_connect": getattr(state, 'wled_restore_state_on_connect', True),
+            "wled_power_off_on_exit": getattr(state, 'wled_power_off_on_exit', False),
             "dw_led": {
                 "num_leds": state.dw_led_num_leds,
                 "gpio_pin": state.dw_led_gpio_pin,
@@ -797,6 +866,8 @@ async def update_settings(settings_update: SettingsUpdate):
             state.app_name = settings_update.app.name or "Dune Weaver"
         if settings_update.app.custom_logo is not None:
             state.custom_logo = settings_update.app.custom_logo or None
+        if settings_update.app.cache_worker_count is not None:
+            state.cache_worker_count = max(1, settings_update.app.cache_worker_count)  # Ensure at least 1 worker
         updated_categories.append("app")
 
     # Connection settings
@@ -804,17 +875,45 @@ async def update_settings(settings_update: SettingsUpdate):
         if settings_update.connection.preferred_port is not None:
             # Store exactly what frontend sends: "__auto__", "__none__", or specific port
             state.preferred_port = settings_update.connection.preferred_port
+        if settings_update.connection.connection_type is not None:
+            state.connection_type = settings_update.connection.connection_type
+        if settings_update.connection.websocket_host is not None:
+            state.websocket_host = settings_update.connection.websocket_host
+        if settings_update.connection.websocket_port is not None:
+            state.websocket_port = settings_update.connection.websocket_port
+        if settings_update.connection.auto_connect_enabled is not None:
+            state.auto_connect_enabled = settings_update.connection.auto_connect_enabled
+        if settings_update.connection.default_connection_method is not None:
+            state.default_connection_method = settings_update.connection.default_connection_method
+        if settings_update.connection.frontend_api_host is not None:
+            state.frontend_api_host = settings_update.connection.frontend_api_host
+        if settings_update.connection.frontend_api_port is not None:
+            state.frontend_api_port = settings_update.connection.frontend_api_port
         updated_categories.append("connection")
 
     # Pattern settings
     if settings_update.patterns:
         p = settings_update.patterns
+        old_clear_speed = state.clear_pattern_speed
         if p.clear_pattern_speed is not None:
             state.clear_pattern_speed = p.clear_pattern_speed if p.clear_pattern_speed > 0 else None
+            # Trigger duration cache recalculation if clear_pattern_speed changed
+            if old_clear_speed != state.clear_pattern_speed:
+                logger.info(f"Clear pattern speed changed from {old_clear_speed} to {state.clear_pattern_speed}, triggering duration recalculation")
+                cache = pattern_duration_cache.get_duration_cache()
+                if cache:
+                    speeds = [state.speed if state.speed and state.speed > 0 else 100]
+                    if state.clear_pattern_speed and state.clear_pattern_speed > 0 and state.clear_pattern_speed not in speeds:
+                        speeds.append(state.clear_pattern_speed)
+                    cache.calculate_all_patterns_async(speeds=speeds)
         if p.custom_clear_from_in is not None:
             state.custom_clear_from_in = p.custom_clear_from_in or None
         if p.custom_clear_from_out is not None:
             state.custom_clear_from_out = p.custom_clear_from_out or None
+        if p.post_execution_command is not None:
+            state.post_execution_command = p.post_execution_command or None
+        if p.post_execution_enabled is not None:
+            state.post_execution_enabled = p.post_execution_enabled
         updated_categories.append("patterns")
 
     # Auto-play settings
@@ -879,6 +978,10 @@ async def update_settings(settings_update: SettingsUpdate):
                 led_reinit_needed = True
         if led.wled_ip is not None:
             state.wled_ip = led.wled_ip or None
+        if led.wled_restore_state_on_connect is not None:
+            state.wled_restore_state_on_connect = led.wled_restore_state_on_connect
+        if led.wled_power_off_on_exit is not None:
+            state.wled_power_off_on_exit = led.wled_power_off_on_exit
         if led.dw_led:
             dw = led.dw_led
             if dw.num_leds is not None:
@@ -1262,23 +1365,48 @@ async def list_ports():
 
 @app.post("/connect")
 async def connect(request: ConnectRequest):
-    if not request.port:
-        state.conn = connection_manager.WebSocketConnection('ws://fluidnc.local:81')
-        if not connection_manager.device_init():
-            raise HTTPException(status_code=500, detail="Failed to initialize device - could not get machine parameters")
-        logger.info('Successfully connected to websocket ws://fluidnc.local:81')
-        return {"success": True}
-
     try:
-        state.conn = connection_manager.SerialConnection(request.port)
-        if not connection_manager.device_init():
-            raise HTTPException(status_code=500, detail="Failed to initialize device - could not get machine parameters")
-        logger.info(f'Successfully connected to serial port {request.port}')
-        return {"success": True}
+        # Determine connection type from request or state
+        connection_type = getattr(request, 'connection_type', None) or state.connection_type
+
+        if connection_type == 'websocket':
+            # Use WebSocket connection
+            host = getattr(request, 'websocket_host', None) or state.websocket_host
+            port = getattr(request, 'websocket_port', None) or state.websocket_port
+            ws_url = f'ws://{host}:{port}'
+
+            logger.info(f'Attempting WebSocket connection to {ws_url}')
+            state.conn = connection_manager.WebSocketConnection(ws_url)
+            if not connection_manager.device_init():
+                raise HTTPException(status_code=500, detail="Failed to initialize device - could not get machine parameters")
+
+            # Save the WebSocket settings that were actually used for connection
+            state.websocket_host = host
+            state.websocket_port = port
+            state.connection_type = 'websocket'
+            state.save()
+            logger.info(f'Successfully connected via WebSocket to {ws_url}')
+            return {"success": True, "message": f"Connected to {ws_url}"}
+
+        else:
+            # Use Serial connection
+            if not request.port:
+                raise HTTPException(status_code=400, detail="Port is required for serial connection")
+
+            logger.info(f'Attempting serial connection to {request.port}')
+            state.conn = connection_manager.SerialConnection(request.port)
+            if not connection_manager.device_init():
+                raise HTTPException(status_code=500, detail="Failed to initialize device - could not get machine parameters")
+
+            state.connection_type = 'serial'
+            state.save()
+            logger.info(f'Successfully connected to serial port {request.port}')
+            return {"success": True, "message": f"Connected to {request.port}"}
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f'Failed to connect to serial port {request.port}: {str(e)}')
+        logger.error(f'Failed to connect: {str(e)}')
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/disconnect")
@@ -1551,6 +1679,12 @@ async def list_theta_rho_files_with_metadata():
         cache_dict = cache_data.get('data', {})
         logger.debug(f"Loaded metadata cache with {len(cache_dict)} entries")
 
+        # Get duration cache instance
+        duration_cache = pattern_duration_cache.get_duration_cache()
+        current_speed = state.speed if state.speed and state.speed > 0 else 100
+        clear_speed = state.clear_pattern_speed if state.clear_pattern_speed and state.clear_pattern_speed > 0 else current_speed
+        logger.debug(f"Listing patterns with durations - normal speed: {current_speed} mm/min, clear speed: {clear_speed} mm/min")
+
         # Process all files using cached data only
         for file_path in files:
             try:
@@ -1571,12 +1705,22 @@ async def list_theta_rho_files_with_metadata():
                     coords_count = 0
                     date_modified = 0
 
+                # Get estimated duration from duration cache
+                estimated_duration = None
+                if duration_cache:
+                    # Use just the filename (with extension) as the pattern name
+                    pattern_name = os.path.basename(file_path)
+                    # Use clear_pattern_speed for patterns starting with "clear_"
+                    speed_to_use = clear_speed if pattern_name.startswith('clear_') else current_speed
+                    estimated_duration = duration_cache.get_duration(pattern_name, speed_to_use)
+
                 files_with_metadata.append({
                     'path': file_path,
                     'name': file_name,
                     'category': category,
                     'date_modified': date_modified,
-                    'coordinates_count': coords_count
+                    'coordinates_count': coords_count,
+                    'estimated_duration': estimated_duration
                 })
 
             except Exception as e:
@@ -1589,12 +1733,17 @@ async def list_theta_rho_files_with_metadata():
                     'name': os.path.splitext(os.path.basename(file_path))[0],
                     'category': category,
                     'date_modified': 0,
-                    'coordinates_count': 0
+                    'coordinates_count': 0,
+                    'estimated_duration': None
                 })
 
     except Exception as e:
         logger.error(f"Failed to load metadata cache, falling back to slow method: {e}")
         # Fallback to original method if cache loading fails
+        # Get duration cache for fallback path as well
+        duration_cache = pattern_duration_cache.get_duration_cache()
+        current_speed = state.speed if state.speed and state.speed > 0 else 100
+
         # Create tasks only when needed
         loop = asyncio.get_running_loop()
         tasks = [loop.run_in_executor(executor, process_file, file_path) for file_path in files]
@@ -1602,12 +1751,36 @@ async def list_theta_rho_files_with_metadata():
         for task in asyncio.as_completed(tasks):
             try:
                 result = await task
+                # Add estimated duration to result
+                if duration_cache:
+                    pattern_name = os.path.basename(result['path'])
+                    estimated_duration = duration_cache.get_duration(pattern_name, current_speed)
+                    result['estimated_duration'] = estimated_duration
+                else:
+                    result['estimated_duration'] = None
                 files_with_metadata.append(result)
             except Exception as task_error:
                 logger.error(f"Error processing file: {str(task_error)}")
 
     # Clean up executor
     executor.shutdown(wait=False)
+
+    # Check if any patterns are missing durations and trigger calculation in background
+    try:
+        patterns_missing_durations = sum(1 for f in files_with_metadata if f.get('estimated_duration') is None)
+        if patterns_missing_durations > 0:
+            cache = pattern_duration_cache.get_duration_cache()
+            if cache and not cache.is_calculating:
+                logger.info(f"Detected {patterns_missing_durations} patterns without durations, triggering background calculation")
+                # Get current speeds
+                default_speed = state.speed if state.speed and state.speed > 0 else 100
+                speeds = [default_speed]
+                if state.clear_pattern_speed and state.clear_pattern_speed > 0 and state.clear_pattern_speed != default_speed:
+                    speeds.append(state.clear_pattern_speed)
+                # Trigger calculation in background thread (non-blocking)
+                asyncio.create_task(asyncio.to_thread(cache.calculate_all_patterns_async, speeds))
+    except Exception as e:
+        logger.debug(f"Error checking for missing durations: {e}")
 
     return files_with_metadata
 
@@ -1655,10 +1828,86 @@ async def upload_theta_rho(file: UploadFile = File(...)):
                 logger.error(f"Error generating preview for {file_path_in_patterns_dir} (attempt {attempt + 1}): {str(e)}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5)  # Small delay before retry
-        
+
+        # Calculate duration for the new pattern in background
+        try:
+            default_speed = state.speed if state.speed and state.speed > 0 else 100
+            await asyncio.to_thread(
+                pattern_duration_cache.calculate_new_pattern,
+                full_file_path,
+                speeds=[default_speed]
+            )
+            logger.info(f"Duration calculation started for {file.filename}")
+        except Exception as e:
+            logger.warning(f"Failed to start duration calculation for {file.filename}: {str(e)}")
+
         return {"success": True, "message": f"File {file.filename} uploaded successfully"}
     except Exception as e:
         logger.error(f"Error uploading file: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/studio/save_pattern")
+async def save_pattern_from_studio(request: dict):
+    """Save a pattern from the studio editor.
+
+    Accepts:
+        path: Pattern path (may include subdirectories, e.g., "custom_patterns/mypattern.thr")
+        content: Pattern content (.thr format)
+
+    Overwrites existing files with the same path.
+    """
+    try:
+        pattern_path = request.get('path', '').strip()
+        content = request.get('content', '')
+
+        if not pattern_path:
+            raise HTTPException(status_code=400, detail="Pattern path is required")
+
+        if not pattern_path.endswith('.thr'):
+            raise HTTPException(status_code=400, detail="Pattern must have .thr extension")
+
+        if not content:
+            raise HTTPException(status_code=400, detail="Pattern content is required")
+
+        # Build full file path
+        full_path = os.path.join(pattern_manager.THETA_RHO_DIR, pattern_path)
+
+        # Create subdirectories if needed
+        directory = os.path.dirname(full_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        # Write pattern file (overwrites if exists)
+        with open(full_path, 'w') as f:
+            f.write(content)
+
+        logger.info(f"Pattern saved from studio: {pattern_path}")
+
+        # Trigger cache generation for the new/updated pattern
+        try:
+            from modules.core.cache_manager import generate_image_preview, cache_pattern_metadata
+            asyncio.create_task(generate_image_preview(pattern_path))
+            asyncio.create_task(cache_pattern_metadata(pattern_path))
+        except Exception as e:
+            logger.warning(f"Failed to generate preview for {pattern_path}: {str(e)}")
+
+        # Calculate duration for the pattern in background
+        try:
+            default_speed = state.speed if state.speed and state.speed > 0 else 100
+            await asyncio.to_thread(
+                pattern_duration_cache.calculate_new_pattern,
+                full_path,
+                speeds=[default_speed]
+            )
+        except Exception as e:
+            logger.warning(f"Failed to calculate duration for {pattern_path}: {str(e)}")
+
+        return {"success": True, "message": f"Pattern saved: {pattern_path}"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving pattern from studio: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/get_theta_rho_coordinates")
@@ -2178,6 +2427,279 @@ async def get_all_pattern_history():
         logger.error(f"Failed to read execution time log: {e}")
         return {}
 
+@app.get("/api/execution_history")
+async def get_execution_history(limit: int = 100, offset: int = 0):
+    """Get complete execution history sorted by timestamp (newest first).
+
+    Returns all execution events including patterns, clear patterns, and manual controls.
+
+    Args:
+        limit: Maximum number of entries to return (default 100)
+        offset: Number of entries to skip (for pagination, default 0)
+
+    Returns:
+        List of execution history entries with type, name, timestamp, duration, etc.
+    """
+    from modules.core.pattern_manager import EXECUTION_LOG_FILE
+
+    if not os.path.exists(EXECUTION_LOG_FILE):
+        return {"entries": [], "total": 0, "has_more": False}
+
+    try:
+        all_entries = []
+
+        # Read all entries from the execution log
+        with open(EXECUTION_LOG_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    # Only include completed executions
+                    if entry.get('completed', False):
+                        # Determine entry type based on pattern name
+                        pattern_name = entry.get('pattern_name', '')
+                        entry_type = 'clear' if pattern_name.startswith('clear_') else 'pattern'
+
+                        all_entries.append({
+                            "type": entry_type,
+                            "pattern_name": pattern_name,
+                            "timestamp": entry.get('timestamp'),
+                            "actual_time_seconds": entry.get('actual_time_seconds'),
+                            "actual_time_formatted": entry.get('actual_time_formatted'),
+                            "speed": entry.get('speed'),
+                            "table_type": entry.get('table_type'),
+                            "total_coordinates": entry.get('total_coordinates')
+                        })
+                except json.JSONDecodeError:
+                    continue
+
+        # Sort by timestamp (newest first)
+        all_entries.sort(key=lambda x: x['timestamp'] or '', reverse=True)
+
+        # Calculate pagination
+        total = len(all_entries)
+        has_more = (offset + limit) < total
+
+        # Apply pagination
+        paginated_entries = all_entries[offset:offset + limit]
+
+        return {
+            "entries": paginated_entries,
+            "total": total,
+            "has_more": has_more
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to read execution history: {e}")
+        return {"entries": [], "total": 0, "has_more": False}
+
+@app.get("/api/patterns")
+async def get_patterns_list():
+    """Get list of all patterns with metadata for simple frontend."""
+    try:
+        patterns = []
+        pattern_files = pattern_manager.list_theta_rho_files()
+
+        for pattern_file in pattern_files:
+            # Get pattern name
+            name = pattern_file.replace('.thr', '').split('/')[-1]
+
+            # Get duration if available
+            duration = None
+            try:
+                duration_data = pattern_duration_cache.duration_cache.get_duration(pattern_file)
+                if duration_data and isinstance(duration_data, dict) and 100 in duration_data:
+                    duration = duration_data[100]
+            except Exception:
+                pass
+
+            patterns.append({
+                "path": pattern_file,
+                "name": name,
+                "duration": duration
+            })
+
+        return JSONResponse(content={
+            "patterns": patterns
+        })
+    except Exception as e:
+        logger.error(f"Error getting patterns list: {e}")
+        return JSONResponse(
+            content={"error": str(e)},
+            status_code=500
+        )
+
+@app.get("/api/state")
+async def get_state():
+    """Get current playback state for simple frontend."""
+    try:
+        return JSONResponse(content={
+            "current_pattern": state.current_pattern,
+            "is_paused": state.is_paused,
+            "is_playing": bool(state.current_pattern),
+            "connection_status": connection_manager.connection_status
+        })
+    except Exception as e:
+        logger.error(f"Error getting state: {e}")
+        return JSONResponse(
+            content={"error": str(e)},
+            status_code=500
+        )
+
+@app.get("/api/patterns/{pattern_path:path}")
+async def serve_pattern_file(pattern_path: str):
+    """Serve raw pattern file content for editing in Studio.
+
+    Args:
+        pattern_path: Path to the pattern file (may include subdirectories)
+
+    Returns:
+        Plain text content of the .thr file
+    """
+    try:
+        # Normalize and sanitize path
+        pattern_path = normalize_file_path(pattern_path)
+
+        # Build full path
+        full_path = os.path.join(pattern_manager.THETA_RHO_DIR, pattern_path)
+
+        # Security check - ensure path is within patterns directory
+        real_pattern_dir = os.path.realpath(pattern_manager.THETA_RHO_DIR)
+        real_file_path = os.path.realpath(full_path)
+
+        if not real_file_path.startswith(real_pattern_dir):
+            logger.warning(f"Attempted path traversal: {pattern_path}")
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        # Check if file exists
+        if not os.path.exists(full_path):
+            logger.error(f"Pattern file not found: {pattern_path}")
+            raise HTTPException(status_code=404, detail="Pattern file not found")
+
+        # Read and return file content
+        with open(full_path, 'r') as f:
+            content = f.read()
+
+        return Response(content=content, media_type="text/plain")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving pattern file {pattern_path}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/server/status")
+async def get_server_status():
+    """Get server status information."""
+    try:
+        import subprocess
+        import sys
+
+        # Check if running under systemd
+        service_name = "dune-weaver"
+        is_systemd = False
+        systemd_status = "unknown"
+
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", service_name],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            is_systemd = True
+            systemd_status = result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            is_systemd = False
+
+        return {
+            "running": True,  # If this endpoint responds, server is running
+            "is_systemd": is_systemd,
+            "systemd_status": systemd_status if is_systemd else None,
+            "python_version": sys.version,
+            "pid": os.getpid()
+        }
+    except Exception as e:
+        logger.error(f"Error getting server status: {e}")
+        return {"running": True, "error": str(e)}
+
+@app.post("/api/server/restart")
+async def restart_server():
+    """Restart the server process."""
+    try:
+        import subprocess
+        import sys
+
+        service_name = "dune-weaver"
+
+        # Try systemd first
+        try:
+            subprocess.run(
+                ["systemctl", "restart", service_name],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=True
+            )
+            return {"success": True, "message": "Server restart initiated via systemd"}
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass
+
+        # Fallback: restart using python
+        logger.info("Restarting server via Python exec...")
+
+        # Schedule restart after response is sent
+        async def delayed_restart():
+            await asyncio.sleep(1)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        asyncio.create_task(delayed_restart())
+
+        return {"success": True, "message": "Server restart initiated"}
+
+    except Exception as e:
+        logger.error(f"Error restarting server: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/server/stop")
+async def stop_server():
+    """Stop the server process."""
+    try:
+        import subprocess
+
+        service_name = "dune-weaver"
+
+        # Try systemd first
+        try:
+            subprocess.run(
+                ["systemctl", "stop", service_name],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=True
+            )
+            return {"success": True, "message": "Server stop initiated via systemd"}
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass
+
+        # Fallback: stop current process
+        logger.info("Stopping server...")
+
+        # Schedule shutdown after response is sent
+        async def delayed_shutdown():
+            await asyncio.sleep(1)
+            os._exit(0)
+
+        asyncio.create_task(delayed_shutdown())
+
+        return {"success": True, "message": "Server shutdown initiated"}
+
+    except Exception as e:
+        logger.error(f"Error stopping server: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/preview/{encoded_filename}")
 async def serve_preview(encoded_filename: str):
     """Serve a preview image for a pattern file."""
@@ -2256,7 +2778,10 @@ async def serial_status():
     return {
         "connected": connected,
         "port": port,
-        "preferred_port": state.preferred_port
+        "preferred_port": state.preferred_port,
+        "connection_type": state.connection_type,
+        "websocket_host": state.websocket_host,
+        "websocket_port": state.websocket_port
     }
 
 @app.get("/api/preferred-port", deprecated=True, tags=["settings-deprecated"])
@@ -2393,7 +2918,8 @@ async def run_playlist_endpoint(request: PlaylistRequest):
             pause_time=request.pause_time,
             clear_pattern=request.clear_pattern,
             run_mode=request.run_mode,
-            shuffle=request.shuffle
+            shuffle=request.shuffle,
+            start_index=request.start_index
         )
         if not success:
             raise HTTPException(status_code=409, detail=message)
@@ -2414,13 +2940,74 @@ async def set_speed(request: SpeedRequest):
             logger.warning(f"Invalid speed value received: {request.speed}")
             raise HTTPException(status_code=400, detail="Invalid speed value")
 
+        old_speed = state.speed
         state.speed = request.speed
+
+        # Trigger duration cache recalculation if speed changed
+        if old_speed != request.speed:
+            logger.info(f"Speed changed from {old_speed} to {request.speed}, triggering duration recalculation")
+            cache = pattern_duration_cache.get_duration_cache()
+            if cache:
+                speeds = [request.speed]
+                if state.clear_pattern_speed and state.clear_pattern_speed > 0 and state.clear_pattern_speed != request.speed:
+                    speeds.append(state.clear_pattern_speed)
+                cache.calculate_all_patterns_async(speeds=speeds)
+
         return {"success": True, "speed": request.speed}
     except HTTPException:
         raise  # Re-raise HTTPException as-is
     except Exception as e:
         logger.error(f"Failed to set speed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/toggle_actual_position_tracking")
+async def toggle_actual_position_tracking(request: Request):
+    """Toggle real-time actual position tracking from FluidNC.
+
+    When enabled, the backend will poll FluidNC for actual ball position
+    every 200ms and broadcast it via WebSocket for real-time preview.
+    """
+    data = await request.json()
+    enable = data.get("enable", False)
+    state.enable_actual_position_tracking = enable
+    logger.info(f"Actual position tracking {'enabled' if enable else 'disabled'}")
+
+    # Start or stop the tracking task immediately
+    if enable:
+        # Stop any existing tracking task first
+        if state.actual_position_tracking_task and not state.actual_position_tracking_task.done():
+            state.actual_position_tracking_task.cancel()
+            try:
+                await state.actual_position_tracking_task
+            except asyncio.CancelledError:
+                pass
+
+        # Set reference positions if we have a current position
+        if state.current_playing_file:
+            state.reference_theta = state.current_theta
+            state.reference_rho = state.current_rho
+            state.reference_machine_x = state.machine_x
+            state.reference_machine_y = state.machine_y
+
+            # Reset actual position to reference
+            state.actual_theta = state.reference_theta
+            state.actual_rho = state.reference_rho
+
+            # Start new tracking task
+            from modules.core import pattern_manager
+            state.actual_position_tracking_task = asyncio.create_task(pattern_manager.actual_position_tracker())
+            logger.info("Started actual position tracking task")
+    else:
+        # Stop the tracking task
+        if state.actual_position_tracking_task and not state.actual_position_tracking_task.done():
+            state.actual_position_tracking_task.cancel()
+            try:
+                await state.actual_position_tracking_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Stopped actual position tracking task")
+
+    return {"success": True, "enabled": enable}
 
 @app.get("/check_software_update")
 async def check_updates():
@@ -3744,29 +4331,10 @@ async def rebuild_cache_endpoint():
         raise HTTPException(status_code=500, detail=str(e))
 
 def signal_handler(signum, frame):
-    """Handle shutdown signals gracefully."""
-    logger.info("Received shutdown signal, cleaning up...")
-    try:
-        # Turn off all LEDs on shutdown
-        if state.led_controller:
-            state.led_controller.set_power(0)
-
-        # Stop pattern manager motion controller
-        pattern_manager.motion_controller.stop()
-
-        # Set stop flags to halt any running patterns
-        state.stop_requested = True
-        state.pause_requested = False
-
-        state.save()
-        logger.info("Cleanup completed")
-    except Exception as e:
-        logger.error(f"Error during cleanup: {str(e)}")
-    finally:
-        logger.info("Exiting application...")
-        # Use os._exit after cleanup is complete to avoid async stack tracebacks
-        # This is safe because we've already: shut down process pool, stopped motion controller, saved state
-        os._exit(0)
+    """Handle shutdown signals - exit immediately."""
+    logger.info("Received shutdown signal, exiting immediately...")
+    # Force immediate exit with no cleanup
+    os._exit(0)
 
 @app.get("/api/version")
 async def get_version_info(force_refresh: bool = False):
@@ -3812,6 +4380,401 @@ async def trigger_update():
         logger.error(f"Error triggering update: {e}")
         return JSONResponse(
             content={"success": False, "message": f"Failed to trigger update: {str(e)}"},
+            status_code=500
+        )
+
+@app.get("/api/duration-cache/status")
+async def get_duration_cache_status():
+    """Get pattern duration cache calculation status"""
+    try:
+        cache = pattern_duration_cache.get_duration_cache()
+        if cache:
+            status = cache.get_status()
+            return JSONResponse(content={"success": True, **status})
+        else:
+            return JSONResponse(content={
+                "success": False,
+                "is_calculating": False,
+                "is_paused": False,
+                "total_patterns": 0,
+                "calculated_patterns": 0,
+                "cache_size": 0
+            })
+    except Exception as e:
+        logger.error(f"Error getting duration cache status: {e}")
+        return JSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=500
+        )
+
+@app.get("/api/duration-cache/status/stream")
+async def stream_duration_cache_status(request: Request):
+    """Stream pattern duration cache status updates via SSE"""
+    async def event_generator():
+        try:
+            cache = pattern_duration_cache.get_duration_cache()
+            last_status = None
+            logger.debug("SSE stream started for duration cache status")
+
+            while True:
+                try:
+                    # Check if client disconnected
+                    if await request.is_disconnected():
+                        logger.debug("Duration cache SSE client disconnected")
+                        break
+
+                    # Get current status
+                    if cache:
+                        current_status = cache.get_status()
+                    else:
+                        current_status = {
+                            "is_calculating": False,
+                            "is_paused": False,
+                            "total_patterns": 0,
+                            "calculated_patterns": 0,
+                            "cache_size": 0
+                        }
+
+                    # Only send update if status changed
+                    if current_status != last_status:
+                        data = json.dumps(current_status)
+                        yield f"data: {data}\n\n"
+                        last_status = current_status.copy()
+
+                    # Wait before next check
+                    await asyncio.sleep(1)
+
+                except Exception as loop_error:
+                    logger.error(f"Error in SSE loop iteration: {loop_error}", exc_info=True)
+                    # Don't break, try to continue
+                    await asyncio.sleep(1)
+
+        except asyncio.CancelledError:
+            logger.debug("Duration cache SSE stream cancelled")
+        except Exception as e:
+            logger.error(f"Error in duration cache SSE stream: {e}", exc_info=True)
+        finally:
+            logger.debug("SSE stream ended for duration cache status")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+@app.post("/api/duration-cache/start")
+async def start_duration_cache():
+    """Start pattern duration calculation"""
+    try:
+        cache = pattern_duration_cache.get_duration_cache()
+        if cache:
+            default_speed = state.speed if state.speed and state.speed > 0 else 100
+            # Also calculate for clear_pattern_speed if it's different
+            speeds = [default_speed]
+            if state.clear_pattern_speed and state.clear_pattern_speed > 0 and state.clear_pattern_speed != default_speed:
+                speeds.append(state.clear_pattern_speed)
+            logger.info(f"Starting duration calculation with speeds: {speeds} mm/min (state.speed={state.speed}, clear_speed={state.clear_pattern_speed})")
+            cache.calculate_all_patterns_async(speeds=speeds)
+            return JSONResponse(content={"success": True, "message": f"Duration calculation started with speeds {speeds} mm/min"})
+        else:
+            return JSONResponse(
+                content={"success": False, "message": "Duration cache not initialized"},
+                status_code=400
+            )
+    except Exception as e:
+        logger.error(f"Error starting duration cache: {e}")
+        return JSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=500
+        )
+
+@app.post("/api/duration-cache/pause")
+async def pause_duration_cache():
+    """Pause pattern duration calculation"""
+    try:
+        cache = pattern_duration_cache.get_duration_cache()
+        if cache:
+            success = cache.pause()
+            if success:
+                return JSONResponse(content={"success": True, "message": "Duration calculation paused"})
+            else:
+                return JSONResponse(
+                    content={"success": False, "message": "Cannot pause - not currently calculating or already paused"},
+                    status_code=400
+                )
+        else:
+            return JSONResponse(
+                content={"success": False, "message": "Duration cache not initialized"},
+                status_code=400
+            )
+    except Exception as e:
+        logger.error(f"Error pausing duration cache: {e}")
+        return JSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=500
+        )
+
+@app.post("/api/duration-cache/resume")
+async def resume_duration_cache():
+    """Resume pattern duration calculation"""
+    try:
+        cache = pattern_duration_cache.get_duration_cache()
+        if cache:
+            success = cache.resume()
+            if success:
+                return JSONResponse(content={"success": True, "message": "Duration calculation resumed"})
+            else:
+                return JSONResponse(
+                    content={"success": False, "message": "Cannot resume - not currently paused"},
+                    status_code=400
+                )
+        else:
+            return JSONResponse(
+                content={"success": False, "message": "Duration cache not initialized"},
+                status_code=400
+            )
+    except Exception as e:
+        logger.error(f"Error resuming duration cache: {e}")
+        return JSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=500
+        )
+
+@app.post("/api/duration-cache/stop")
+async def stop_duration_cache():
+    """Stop pattern duration calculation"""
+    try:
+        cache = pattern_duration_cache.get_duration_cache()
+        if cache:
+            success = cache.stop()
+            if success:
+                return JSONResponse(content={"success": True, "message": "Duration calculation stop requested"})
+            else:
+                return JSONResponse(
+                    content={"success": False, "message": "Cannot stop - not currently calculating"},
+                    status_code=400
+                )
+        else:
+            return JSONResponse(
+                content={"success": False, "message": "Duration cache not initialized"},
+                status_code=400
+            )
+    except Exception as e:
+        logger.error(f"Error stopping duration cache: {e}")
+        return JSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=500
+        )
+
+@app.post("/api/duration-cache/clear")
+async def clear_duration_cache():
+    """Clear all cached pattern durations"""
+    try:
+        logger.info("Clear cache request received")
+        cache = pattern_duration_cache.get_duration_cache()
+        if cache:
+            # Stop any running calculation first
+            if cache.is_calculating:
+                logger.info("Stopping running calculation before clearing cache")
+                cache.stop()
+                # Wait for it to actually stop
+                max_wait = 2.0
+                waited = 0
+                while cache.is_calculating and waited < max_wait:
+                    await asyncio.sleep(0.1)
+                    waited += 0.1
+                if cache.is_calculating:
+                    logger.warning("Calculation still running after 2s, clearing anyway")
+
+            logger.info("Clearing duration cache")
+            cache.clear_cache()
+            logger.info("Duration cache cleared successfully")
+            return JSONResponse(content={"success": True, "message": "Duration cache cleared"})
+        else:
+            logger.warning("Duration cache not initialized")
+            return JSONResponse(
+                content={"success": False, "message": "Duration cache not initialized"},
+                status_code=400
+            )
+    except Exception as e:
+        logger.error(f"Error clearing duration cache: {e}", exc_info=True)
+        return JSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=500
+        )
+
+@app.get("/api/preview-cache/status")
+async def get_preview_cache_status():
+    """Get pattern preview cache generation status"""
+    try:
+        from modules.core.cache_manager import get_cache_progress
+        from modules.core.pattern_manager import list_theta_rho_files
+        import os
+
+        progress = get_cache_progress()
+
+        # Count cached images
+        cached_count = 0
+        if os.path.exists(cache_manager.CACHE_DIR):
+            pattern_files = list_theta_rho_files()
+            for pattern in pattern_files:
+                cache_path = cache_manager.get_cache_path(pattern)
+                if os.path.exists(cache_path):
+                    cached_count += 1
+
+        return JSONResponse(content={
+            "success": True,
+            "is_running": progress["is_running"],
+            "stage": progress["stage"],
+            "total_files": progress["total_files"],
+            "processed_files": progress["processed_files"],
+            "current_file": progress["current_file"],
+            "cache_size": cached_count,
+            "error": progress["error"]
+        })
+    except Exception as e:
+        logger.error(f"Error getting preview cache status: {e}")
+        return JSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=500
+        )
+
+@app.get("/api/preview-cache/status/stream")
+async def stream_preview_cache_status(request: Request):
+    """Stream pattern preview cache status updates via SSE"""
+    async def event_generator():
+        try:
+            from modules.core.cache_manager import get_cache_progress
+            from modules.core.pattern_manager import list_theta_rho_files
+            import os
+
+            last_status = None
+            logger.debug("SSE stream started for preview cache status")
+
+            while True:
+                try:
+                    # Check if client disconnected
+                    if await request.is_disconnected():
+                        logger.debug("Preview cache SSE client disconnected")
+                        break
+
+                    # Get current status
+                    progress = get_cache_progress()
+
+                    # Count cached images
+                    cached_count = 0
+                    if os.path.exists(cache_manager.CACHE_DIR):
+                        pattern_files = list_theta_rho_files()
+                        for pattern in pattern_files:
+                            cache_path = cache_manager.get_cache_path(pattern)
+                            if os.path.exists(cache_path):
+                                cached_count += 1
+
+                    current_status = {
+                        "is_running": progress["is_running"],
+                        "stage": progress["stage"],
+                        "total_files": progress["total_files"],
+                        "processed_files": progress["processed_files"],
+                        "current_file": progress["current_file"],
+                        "cache_size": cached_count,
+                        "error": progress["error"]
+                    }
+
+                    # Only send update if status changed
+                    if current_status != last_status:
+                        data = json.dumps(current_status)
+                        yield f"data: {data}\n\n"
+                        last_status = current_status.copy()
+
+                    # Wait before next check
+                    await asyncio.sleep(1)
+
+                except Exception as loop_error:
+                    logger.error(f"Error in SSE loop iteration: {loop_error}", exc_info=True)
+                    # Don't break, try to continue
+                    await asyncio.sleep(1)
+
+        except asyncio.CancelledError:
+            logger.debug("Preview cache SSE stream cancelled")
+        except Exception as e:
+            logger.error(f"Error in preview cache SSE stream: {e}", exc_info=True)
+        finally:
+            logger.debug("SSE stream ended for preview cache status")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+@app.post("/api/preview-cache/start")
+async def start_preview_cache():
+    """Start/regenerate pattern preview cache"""
+    try:
+        from modules.core.cache_manager import cache_progress, generate_cache_background
+
+        # Check if already running
+        if cache_progress["is_running"]:
+            return JSONResponse(
+                content={"success": False, "message": "Preview cache generation already running"},
+                status_code=400
+            )
+
+        logger.info("Starting preview cache generation")
+        asyncio.create_task(generate_cache_background())
+        return JSONResponse(content={"success": True, "message": "Preview cache generation started"})
+    except Exception as e:
+        logger.error(f"Error starting preview cache: {e}")
+        return JSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=500
+        )
+
+@app.post("/api/preview-cache/clear")
+async def clear_preview_cache():
+    """Clear all cached pattern previews"""
+    try:
+        import shutil
+
+        logger.info("Clear preview cache request received")
+
+        # Check if cache generation is running
+        from modules.core.cache_manager import cache_progress
+        if cache_progress["is_running"]:
+            return JSONResponse(
+                content={"success": False, "message": "Cannot clear cache while generation is running"},
+                status_code=400
+            )
+
+        # Delete the entire cache directory
+        if os.path.exists(cache_manager.CACHE_DIR):
+            logger.info(f"Deleting cache directory: {cache_manager.CACHE_DIR}")
+            shutil.rmtree(cache_manager.CACHE_DIR)
+            logger.info("Cache directory deleted")
+
+        # Delete metadata cache file
+        if os.path.exists(cache_manager.METADATA_CACHE_FILE):
+            logger.info(f"Deleting metadata cache: {cache_manager.METADATA_CACHE_FILE}")
+            os.remove(cache_manager.METADATA_CACHE_FILE)
+            logger.info("Metadata cache deleted")
+
+        # Recreate cache directory structure
+        cache_manager.ensure_cache_dir()
+        logger.info("Preview cache cleared successfully")
+
+        return JSONResponse(content={"success": True, "message": "Preview cache cleared"})
+    except Exception as e:
+        logger.error(f"Error clearing preview cache: {e}", exc_info=True)
+        return JSONResponse(
+            content={"success": False, "message": str(e)},
             status_code=500
         )
 
@@ -3879,7 +4842,7 @@ async def restart_system():
 def entrypoint():
     import uvicorn
     logger.info("Starting FastAPI server on port 8080...")
-    uvicorn.run(app, host="0.0.0.0", port=8080, workers=1)  # Set workers to 1 to avoid multiple signal handlers
+    uvicorn.run(app, host="192.168.1.200", port=8080, workers=1)  # Set workers to 1 to avoid multiple signal handlers
 
 if __name__ == "__main__":
     entrypoint()

@@ -204,6 +204,24 @@ export const apiClient = new ApiClient()
 // ensuring WebSocket connections use the correct URL from the start.
 function initializeBaseUrlFromStorage(): void {
   try {
+    // First, check for user-configured API settings (takes precedence in dev mode)
+    const API_CONFIG_KEY = 'duneweaver_api_config'
+    const apiConfig = localStorage.getItem(API_CONFIG_KEY)
+
+    if (apiConfig) {
+      try {
+        const config = JSON.parse(apiConfig)
+        if (config.host && config.port) {
+          const baseUrl = `http://${config.host}:${config.port}`
+          apiClient.setBaseUrl(baseUrl)
+          return
+        }
+      } catch {
+        // Invalid config, continue to multi-table logic
+      }
+    }
+
+    // Fall back to multi-table configuration
     const STORAGE_KEY = 'duneweaver_tables'
     const ACTIVE_TABLE_KEY = 'duneweaver_active_table'
 
@@ -237,6 +255,28 @@ function initializeBaseUrlFromStorage(): void {
   } catch {
     // Silently fail - TableContext will handle initialization as fallback
   }
+}
+
+/**
+ * Set API configuration (host and port) and persist to localStorage.
+ * This allows the frontend to connect to a custom backend location.
+ */
+export function setApiConfig(host: string, port: number): void {
+  const API_CONFIG_KEY = 'duneweaver_api_config'
+  const config = { host, port }
+  localStorage.setItem(API_CONFIG_KEY, JSON.stringify(config))
+
+  const baseUrl = `http://${host}:${port}`
+  apiClient.setBaseUrl(baseUrl)
+}
+
+/**
+ * Clear API configuration and revert to default behavior.
+ */
+export function clearApiConfig(): void {
+  const API_CONFIG_KEY = 'duneweaver_api_config'
+  localStorage.removeItem(API_CONFIG_KEY)
+  apiClient.setBaseUrl('')
 }
 
 // Run initialization immediately at module load

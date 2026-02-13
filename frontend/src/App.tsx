@@ -2,6 +2,8 @@ import { Routes, Route } from 'react-router-dom'
 import { Layout } from '@/components/layout/Layout'
 import { BrowsePage } from '@/pages/BrowsePage'
 import { PlaylistsPage } from '@/pages/PlaylistsPage'
+import { HistoryPage } from '@/pages/HistoryPage'
+import { StudioPage } from '@/pages/StudioPage'
 import { TableControlPage } from '@/pages/TableControlPage'
 import { LEDPage } from '@/pages/LEDPage'
 import { SettingsPage } from '@/pages/SettingsPage'
@@ -15,6 +17,8 @@ function App() {
         <Route path="/" element={<Layout />}>
           <Route index element={<BrowsePage />} />
           <Route path="playlists" element={<PlaylistsPage />} />
+          <Route path="history" element={<HistoryPage />} />
+          <Route path="studio" element={<StudioPage />} />
           <Route path="table-control" element={<TableControlPage />} />
           <Route path="led" element={<LEDPage />} />
           <Route path="settings" element={<SettingsPage />} />

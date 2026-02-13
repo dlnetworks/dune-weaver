@@ -9,7 +9,6 @@ Tests the following endpoints:
 """
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
-import os
 
 
 class TestListThetaRhoFiles:

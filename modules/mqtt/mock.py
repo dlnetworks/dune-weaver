@@ -1,7 +1,5 @@
 """Mock MQTT handler implementation."""
-from typing import Dict, Callable
 from .base import BaseMQTTHandler
-from modules.core.state import state
 
 
 

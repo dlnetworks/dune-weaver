@@ -4,7 +4,6 @@ WLED Segment class for Raspberry Pi
 Manages LED strip segments and their effects
 """
 import time
-from typing import List, Callable, Optional
 from .utils.colors import *
 from .utils.palettes import color_from_palette, get_palette
 

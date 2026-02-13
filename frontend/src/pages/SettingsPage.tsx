@@ -33,6 +33,13 @@ interface Settings {
   app_name?: string
   custom_logo?: string
   preferred_port?: string
+  connection_type?: string
+  websocket_host?: string
+  websocket_port?: number
+  auto_connect_enabled?: boolean
+  default_connection_method?: string
+  frontend_api_host?: string
+  frontend_api_port?: number
   // Machine settings
   table_type_override?: string
   detected_table_type?: string
@@ -51,6 +58,9 @@ interface Settings {
   clear_pattern_speed?: number
   custom_clear_from_in?: string
   custom_clear_from_out?: string
+  // Post-execution settings
+  post_execution_command?: string
+  post_execution_enabled?: boolean
 }
 
 interface TimeSlot {
@@ -80,6 +90,8 @@ interface AutoPlaySettings {
 interface LedConfig {
   provider: 'none' | 'wled' | 'dw_leds'
   wled_ip?: string
+  wled_restore_state_on_connect?: boolean
+  wled_power_off_on_exit?: boolean
   num_leds?: number
   gpio_pin?: number
   pixel_order?: string
@@ -97,6 +109,173 @@ interface MqttConfig {
   discovery_prefix?: string
 }
 
+interface ServerStatus {
+  running: boolean
+  is_systemd: boolean
+  systemd_status?: string
+  python_version?: string
+  pid?: number
+  error?: string
+}
+
+// Server Status Section Component
+function ServerStatusSection() {
+  const [status, setStatus] = useState<ServerStatus | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [isRestarting, setIsRestarting] = useState(false)
+  const [isStopping, setIsStopping] = useState(false)
+  const [lastChecked, setLastChecked] = useState<Date | null>(null)
+
+  const fetchStatus = async () => {
+    setIsLoading(true)
+    try {
+      const data = await apiClient.get<ServerStatus>('/api/server/status')
+      setStatus(data)
+      setLastChecked(new Date())
+    } catch (error) {
+      setStatus({ running: false, is_systemd: false, error: 'Failed to connect' })
+      setLastChecked(new Date())
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  // Only fetch once on mount
+  useEffect(() => {
+    fetchStatus()
+  }, [])
+
+  const handleRestart = async () => {
+    if (!confirm('Are you sure you want to restart the server? The UI will reload automatically.')) {
+      return
+    }
+
+    setIsRestarting(true)
+    try {
+      await apiClient.post('/api/server/restart')
+      toast.success('Server restarting...')
+
+      // Wait 3 seconds then reload the page
+      setTimeout(() => {
+        window.location.reload()
+      }, 3000)
+    } catch (error) {
+      toast.error('Failed to restart server')
+      setIsRestarting(false)
+    }
+  }
+
+  const handleStop = async () => {
+    if (!confirm('Are you sure you want to stop the server? You will need to start it manually.')) {
+      return
+    }
+
+    setIsStopping(true)
+    try {
+      await apiClient.post('/api/server/stop')
+      toast.info('Server stopping...')
+    } catch (error) {
+      toast.error('Failed to stop server')
+      setIsStopping(false)
+    }
+  }
+
+  const handleRefresh = () => {
+    fetchStatus()
+  }
+
+  const getStatusColor = () => {
+    if (!status) return 'text-muted-foreground'
+    if (!status.running) return 'text-destructive'
+    if (status.is_systemd && status.systemd_status === 'active') return 'text-green-500'
+    return 'text-green-500'
+  }
+
+  const getStatusText = () => {
+    if (!status) return 'Checking...'
+    if (!status.running) return 'Offline'
+    if (status.is_systemd) return `Running (systemd: ${status.systemd_status || 'unknown'})`
+    return 'Running'
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Status Display */}
+      <div className="flex items-center justify-between p-4 rounded-lg border bg-muted/50">
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <span className={`material-icons text-lg ${getStatusColor()}`}>
+              {status?.running ? 'check_circle' : 'error'}
+            </span>
+            <span className="font-medium">Server Status:</span>
+            <span className={getStatusColor()}>{getStatusText()}</span>
+          </div>
+
+          {status?.running && (
+            <div className="text-sm text-muted-foreground space-y-0.5 ml-7">
+              {status.pid && <div>PID: {status.pid}</div>}
+              {status.python_version && (
+                <div>Python: {status.python_version.split('\n')[0]}</div>
+              )}
+              {lastChecked && (
+                <div>Last checked: {lastChecked.toLocaleTimeString()}</div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={handleRefresh}
+          disabled={isLoading}
+        >
+          <span className="material-icons text-base">refresh</span>
+        </Button>
+      </div>
+
+      {/* Control Buttons */}
+      <div className="flex gap-2">
+        <Button
+          variant="outline"
+          onClick={handleRestart}
+          disabled={isRestarting || isStopping || !status?.running}
+          className="flex-1 gap-2"
+        >
+          <span className="material-icons-outlined text-base">restart_alt</span>
+          {isRestarting ? 'Restarting...' : 'Restart Server'}
+        </Button>
+
+        <Button
+          variant="destructive"
+          onClick={handleStop}
+          disabled={isStopping || isRestarting || !status?.running}
+          className="flex-1 gap-2"
+        >
+          <span className="material-icons-outlined text-base">stop_circle</span>
+          {isStopping ? 'Stopping...' : 'Stop Server'}
+        </Button>
+      </div>
+
+      {/* Info Alert */}
+      <Alert>
+        <span className="material-icons-outlined text-base">info</span>
+        <AlertDescription>
+          {status?.is_systemd ? (
+            <>
+              Server is managed by systemd. Use <code className="text-xs bg-muted px-1 py-0.5 rounded">systemctl start/stop/restart dune-weaver</code> for manual control.
+            </>
+          ) : (
+            <>
+              Server is running as a standalone process. Stopping will require manual restart.
+            </>
+          )}
+        </AlertDescription>
+      </Alert>
+    </div>
+  )
+}
+
 export function SettingsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const sectionParam = searchParams.get('section')
@@ -106,6 +285,11 @@ export function SettingsPage() {
   const [selectedPort, setSelectedPort] = useState('')
   const [isConnected, setIsConnected] = useState(false)
   const [connectionStatus, setConnectionStatus] = useState('Disconnected')
+  const [connectionType, setConnectionType] = useState<'serial' | 'websocket'>('serial')
+  const [websocketHost, setWebsocketHost] = useState('fluidnc.local')
+  const [websocketPort, setWebsocketPort] = useState('81')
+  const [frontendApiHost, setFrontendApiHost] = useState('127.0.0.1')
+  const [frontendApiPort, setFrontendApiPort] = useState('8080')
 
   // Settings state
   const [settings, setSettings] = useState<Settings>({})
@@ -115,6 +299,29 @@ export function SettingsPage() {
 
   // UI state
   const [isLoading, setIsLoading] = useState<string | null>(null)
+
+  // Duration cache state
+  const [durationCacheStatus, setDurationCacheStatus] = useState({
+    is_calculating: false,
+    is_paused: false,
+    total_patterns: 0,
+    calculated_patterns: 0,
+    cache_size: 0
+  })
+
+  // Preview cache state
+  const [previewCacheStatus, setPreviewCacheStatus] = useState({
+    is_running: false,
+    stage: 'idle',
+    total_files: 0,
+    processed_files: 0,
+    pattern_count: 0,
+    current_file: '',
+    cache_size: 0,
+    error: null as string | null,
+    image_total: 0,
+    image_processed: 0
+  })
 
   // Accordion state - controlled by URL params
   const [openSections, setOpenSections] = useState<string[]>(() => {
@@ -215,6 +422,14 @@ export function SettingsPage() {
         }
         break
       case 'application':
+        // Load settings data
+        if (!loadedSections.has('_settings')) {
+          setLoadedSections((prev) => new Set(prev).add('_settings'))
+          await fetchSettings()
+        }
+        // Load duration cache status
+        await fetchDurationCacheStatus()
+        break
       case 'mqtt':
       case 'autoplay':
       case 'stillsands':
@@ -263,6 +478,153 @@ export function SettingsPage() {
     }
   }
 
+  const fetchDurationCacheStatus = async () => {
+    try {
+      const data = await apiClient.get<{
+        is_calculating: boolean
+        is_paused: boolean
+        total_patterns: number
+        calculated_patterns: number
+        cache_size: number
+      }>('/api/duration-cache/status')
+      setDurationCacheStatus({
+        is_calculating: data.is_calculating,
+        is_paused: data.is_paused,
+        total_patterns: data.total_patterns,
+        calculated_patterns: data.calculated_patterns,
+        cache_size: data.cache_size
+      })
+    } catch (error) {
+      console.error('Failed to fetch duration cache status:', error)
+    }
+  }
+
+  const handleStartDurationCache = async () => {
+    try {
+      setIsLoading('duration-cache')
+      await apiClient.post('/api/duration-cache/start', {})
+      toast.success('Duration calculation started')
+      await fetchDurationCacheStatus()
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to start duration calculation')
+    } finally {
+      setIsLoading(null)
+    }
+  }
+
+  const handlePauseDurationCache = async () => {
+    try {
+      setIsLoading('duration-cache')
+      await apiClient.post('/api/duration-cache/pause', {})
+      toast.success('Duration calculation paused')
+      await fetchDurationCacheStatus()
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to pause duration calculation')
+    } finally {
+      setIsLoading(null)
+    }
+  }
+
+  const handleResumeDurationCache = async () => {
+    try {
+      setIsLoading('duration-cache')
+      await apiClient.post('/api/duration-cache/resume', {})
+      toast.success('Duration calculation resumed')
+      await fetchDurationCacheStatus()
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to resume duration calculation')
+    } finally {
+      setIsLoading(null)
+    }
+  }
+
+  const handleStopDurationCache = async () => {
+    try {
+      setIsLoading('duration-cache')
+      await apiClient.post('/api/duration-cache/stop', {})
+      toast.success('Duration calculation stopped')
+      await fetchDurationCacheStatus()
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to stop duration calculation')
+    } finally {
+      setIsLoading(null)
+    }
+  }
+
+  const handleClearDurationCache = async () => {
+    try {
+      setIsLoading('duration-cache')
+      await apiClient.post('/api/duration-cache/clear', {})
+      toast.success('Duration cache cleared')
+      await fetchDurationCacheStatus()
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to clear duration cache')
+    } finally {
+      setIsLoading(null)
+    }
+  }
+
+  const fetchPreviewCacheStatus = async () => {
+    try {
+      const data = await apiClient.get<{
+        is_running: boolean
+        stage: string
+        total_files: number
+        processed_files: number
+        pattern_count: number
+        current_file: string
+        cache_size: number
+        error: string | null
+        image_total: number
+        image_processed: number
+      }>('/api/preview-cache/status')
+      setPreviewCacheStatus({
+        is_running: data.is_running,
+        stage: data.stage,
+        total_files: data.total_files,
+        processed_files: data.processed_files,
+        pattern_count: data.pattern_count,
+        current_file: data.current_file,
+        cache_size: data.cache_size,
+        error: data.error,
+        image_total: data.image_total,
+        image_processed: data.image_processed
+      })
+    } catch (error) {
+      console.error('Failed to fetch preview cache status:', error)
+    }
+  }
+
+  const handleStartPreviewCache = async () => {
+    try {
+      setIsLoading('preview-cache')
+      await apiClient.post('/api/preview-cache/start', {})
+      toast.success('Preview cache generation started')
+      await fetchPreviewCacheStatus()
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to start preview cache generation')
+    } finally {
+      setIsLoading(null)
+    }
+  }
+
+  const handleClearPreviewCache = async () => {
+    if (!confirm('Are you sure you want to clear all preview caches? This will delete all cached preview images.')) {
+      return
+    }
+
+    try {
+      setIsLoading('preview-cache')
+      await apiClient.post('/api/preview-cache/clear', {})
+      toast.success('Preview cache cleared')
+      await fetchPreviewCacheStatus()
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to clear preview cache')
+    } finally {
+      setIsLoading(null)
+    }
+  }
+
   // Handle accordion open/close and trigger data loading
   const handleAccordionChange = (values: string[]) => {
     // Find newly opened section
@@ -292,6 +654,91 @@ export function SettingsPage() {
     })
   }, [])
 
+  // Subscribe to duration cache status updates via SSE when application section is open
+  useEffect(() => {
+    if (!openSections.includes('application')) return
+
+    // Fetch initial status
+    fetchDurationCacheStatus()
+
+    // Build SSE URL
+    const sseUrl = apiClient.baseUrl
+      ? `${apiClient.baseUrl}/api/duration-cache/status/stream`
+      : '/api/duration-cache/status/stream'
+
+    // Connect to SSE stream
+    const eventSource = new EventSource(sseUrl)
+
+    eventSource.onmessage = (event) => {
+      try {
+        const status = JSON.parse(event.data)
+        setDurationCacheStatus({
+          is_calculating: status.is_calculating,
+          is_paused: status.is_paused,
+          total_patterns: status.total_patterns,
+          calculated_patterns: status.calculated_patterns,
+          cache_size: status.cache_size
+        })
+      } catch (error) {
+        console.error('Error parsing duration cache SSE data:', error)
+      }
+    }
+
+    eventSource.onerror = (error) => {
+      console.error('Duration cache SSE error:', error)
+      eventSource.close()
+    }
+
+    return () => {
+      eventSource.close()
+    }
+  }, [openSections])
+
+  // Subscribe to preview cache status updates via SSE when application section is open
+  useEffect(() => {
+    if (!openSections.includes('application')) return
+
+    // Fetch initial status
+    fetchPreviewCacheStatus()
+
+    // Build SSE URL
+    const sseUrl = apiClient.baseUrl
+      ? `${apiClient.baseUrl}/api/preview-cache/status/stream`
+      : '/api/preview-cache/status/stream'
+
+    // Connect to SSE stream
+    const eventSource = new EventSource(sseUrl)
+
+    eventSource.onmessage = (event) => {
+      try {
+        const status = JSON.parse(event.data)
+        setPreviewCacheStatus({
+          is_running: status.is_running,
+          stage: status.stage,
+          total_files: status.total_files,
+          processed_files: status.processed_files,
+          pattern_count: status.pattern_count,
+          current_file: status.current_file,
+          cache_size: status.cache_size,
+          error: status.error,
+          image_total: status.image_total,
+          image_processed: status.image_processed
+        })
+      } catch (error) {
+        console.error('Error parsing preview cache SSE data:', error)
+      }
+    }
+
+    eventSource.onerror = (error) => {
+      console.error('Preview cache SSE error:', error)
+      eventSource.close()
+    }
+
+    return () => {
+      eventSource.close()
+    }
+  }, [openSections])
+
   const fetchPorts = async () => {
     try {
       // Fetch available ports first
@@ -300,9 +747,18 @@ export function SettingsPage() {
       setPorts(availablePorts)
 
       // Fetch connection status
-      const statusData = await apiClient.get<{ connected: boolean; port?: string }>('/serial_status')
+      const statusData = await apiClient.get<{
+        connected: boolean;
+        port?: string;
+        connection_type?: string;
+        websocket_host?: string;
+        websocket_port?: number;
+      }>('/serial_status')
       setIsConnected(statusData.connected || false)
       setConnectionStatus(statusData.connected ? 'Connected' : 'Disconnected')
+      setConnectionType((statusData.connection_type || 'serial') as 'serial' | 'websocket')
+      setWebsocketHost(statusData.websocket_host || 'fluidnc.local')
+      setWebsocketPort(String(statusData.websocket_port || 81))
 
       // Only set selectedPort if it exists in the available ports list
       // This prevents race conditions where stale port data from a different
@@ -319,9 +775,10 @@ export function SettingsPage() {
     }
   }
 
-  // Always fetch ports on mount since connection is the default section
+  // Always fetch ports and settings on mount since connection is the default section
   useEffect(() => {
     fetchPorts()
+    fetchSettings()
   }, [])
 
   // Refetch when backend reconnects
@@ -338,6 +795,13 @@ export function SettingsPage() {
         app_name: data.app?.name,
         custom_logo: data.app?.custom_logo,
         preferred_port: data.connection?.preferred_port,
+        connection_type: data.connection?.connection_type,
+        websocket_host: data.connection?.websocket_host,
+        websocket_port: data.connection?.websocket_port,
+        auto_connect_enabled: data.connection?.auto_connect_enabled ?? true,
+        default_connection_method: data.connection?.default_connection_method || 'serial',
+        frontend_api_host: data.connection?.frontend_api_host,
+        frontend_api_port: data.connection?.frontend_api_port,
         // Machine settings
         table_type_override: data.machine?.table_type_override,
         detected_table_type: data.machine?.detected_table_type,
@@ -356,6 +820,9 @@ export function SettingsPage() {
         clear_pattern_speed: data.patterns?.clear_pattern_speed,
         custom_clear_from_in: data.patterns?.custom_clear_from_in,
         custom_clear_from_out: data.patterns?.custom_clear_from_out,
+        // Post-execution settings
+        post_execution_command: data.patterns?.post_execution_command,
+        post_execution_enabled: data.patterns?.post_execution_enabled || false,
       })
       // Set auto-play settings
       if (data.auto_play) {
@@ -382,6 +849,14 @@ export function SettingsPage() {
           timezone: data.scheduled_pause.timezone || '',
           time_slots: data.scheduled_pause.time_slots || [],
         })
+      }
+      // Set connection settings
+      if (data.connection) {
+        setConnectionType((data.connection.connection_type || 'serial') as 'serial' | 'websocket')
+        setWebsocketHost(data.connection.websocket_host || 'fluidnc.local')
+        setWebsocketPort(String(data.connection.websocket_port || 81))
+        setFrontendApiHost(data.connection.frontend_api_host || '127.0.0.1')
+        setFrontendApiPort(String(data.connection.frontend_api_port || 8080))
       }
       // Set MQTT config from the same response
       if (data.mqtt) {
@@ -411,6 +886,8 @@ export function SettingsPage() {
         num_leds: data.dw_led_num_leds,
         gpio_pin: data.dw_led_gpio_pin,
         pixel_order: data.dw_led_pixel_order,
+        wled_restore_state_on_connect: data.wled_restore_state_on_connect ?? true,
+        wled_power_off_on_exit: data.wled_power_off_on_exit ?? false,
       })
       setNumLedsInput(String(data.dw_led_num_leds || 60))
     } catch (error) {
@@ -429,17 +906,32 @@ export function SettingsPage() {
   }
 
   const handleConnect = async () => {
-    if (!selectedPort) {
+    if (connectionType === 'serial' && !selectedPort) {
       toast.error('Please select a port')
       return
     }
+    if (connectionType === 'websocket' && (!websocketHost || !websocketPort)) {
+      toast.error('Please enter WebSocket host and port')
+      return
+    }
+
     setIsLoading('connect')
     try {
-      const data = await apiClient.post<{ success?: boolean; message?: string }>('/connect', { port: selectedPort })
+      const payload: any = { connection_type: connectionType }
+
+      if (connectionType === 'serial') {
+        payload.port = selectedPort
+      } else {
+        payload.websocket_host = websocketHost
+        payload.websocket_port = parseInt(websocketPort)
+      }
+
+      const data = await apiClient.post<{ success?: boolean; message?: string }>('/connect', payload)
       if (data.success) {
         setIsConnected(true)
-        setConnectionStatus(`Connected to ${selectedPort}`)
-        toast.success('Connected successfully')
+        const connectedTo = connectionType === 'serial' ? selectedPort : `${websocketHost}:${websocketPort}`
+        setConnectionStatus(`Connected to ${connectedTo}`)
+        toast.success(data.message || 'Connected successfully')
       } else {
         throw new Error(data.message || 'Connection failed')
       }
@@ -469,20 +961,70 @@ export function SettingsPage() {
   const handleSavePreferredPort = async () => {
     setIsLoading('preferredPort')
     try {
-      // Send the actual value: __auto__, __none__, or specific port
-      const portValue = settings.preferred_port || '__auto__'
+      const method = settings.default_connection_method || 'serial'
+      const autoConnect = settings.auto_connect_enabled ?? true
+
+      // Validate: if auto-connect is enabled and method is serial, require a port selection
+      if (autoConnect && method === 'serial' && !settings.preferred_port) {
+        toast.error('Please select a serial port for auto-connect')
+        setIsLoading(null)
+        return
+      }
+
       await apiClient.patch('/api/settings', {
-        connection: { preferred_port: portValue },
+        connection: {
+          preferred_port: settings.preferred_port || null,
+          connection_type: connectionType,
+          websocket_host: websocketHost,
+          websocket_port: parseInt(websocketPort) || 81,
+          auto_connect_enabled: autoConnect,
+          default_connection_method: method,
+        },
       })
-      if (!settings.preferred_port || settings.preferred_port === '__auto__') {
-        toast.success('Auto-connect: Auto (first available port)')
-      } else if (settings.preferred_port === '__none__') {
-        toast.success('Auto-connect: Disabled')
+
+      if (autoConnect) {
+        if (method === 'serial') {
+          toast.success(`Default connection saved: Serial (${settings.preferred_port})`)
+        } else {
+          toast.success(`Default connection saved: WebSocket (${websocketHost}:${websocketPort})`)
+        }
       } else {
-        toast.success(`Auto-connect: ${settings.preferred_port}`)
+        toast.success('Default connection saved: Auto-connect disabled')
       }
     } catch (error) {
-      toast.error('Failed to save auto-connect setting')
+      toast.error('Failed to save default connection setting')
+    } finally {
+      setIsLoading(null)
+    }
+  }
+
+  const handleSaveFrontendApiConfig = async () => {
+    setIsLoading('frontendApi')
+    try {
+      const host = frontendApiHost || '127.0.0.1'
+      const port = parseInt(frontendApiPort) || 8080
+
+      // Save to backend
+      await apiClient.patch('/api/settings', {
+        connection: {
+          frontend_api_host: host,
+          frontend_api_port: port,
+        },
+      })
+
+      // Update apiClient and localStorage for immediate effect
+      const { setApiConfig } = await import('@/lib/apiClient')
+      setApiConfig(host, port)
+
+      toast.success(`Frontend API configuration saved: ${host}:${port}`)
+      toast.info('Page will reload to apply changes', { duration: 2000 })
+
+      // Reload page after a short delay to allow toast to show
+      setTimeout(() => {
+        window.location.reload()
+      }, 2000)
+    } catch (error) {
+      toast.error('Failed to save frontend API configuration')
     } finally {
       setIsLoading(null)
     }
@@ -565,6 +1107,8 @@ export function SettingsPage() {
         num_leds: ledConfig.num_leds,
         gpio_pin: ledConfig.gpio_pin,
         pixel_order: ledConfig.pixel_order,
+        wled_restore_state_on_connect: ledConfig.wled_restore_state_on_connect,
+        wled_power_off_on_exit: ledConfig.wled_power_off_on_exit,
       })
       toast.success('LED configuration saved')
     } catch (error) {
@@ -668,9 +1212,11 @@ export function SettingsPage() {
           clear_pattern_speed: settings.clear_pattern_speed ?? 0,
           custom_clear_from_in: settings.custom_clear_from_in || null,
           custom_clear_from_out: settings.custom_clear_from_out || null,
+          post_execution_command: settings.post_execution_command || null,
+          post_execution_enabled: settings.post_execution_enabled || false,
         },
       })
-      toast.success('Clearing settings saved')
+      toast.success('Pattern settings saved')
     } catch (error) {
       toast.error('Failed to save clearing settings')
     } finally {
@@ -752,6 +1298,26 @@ export function SettingsPage() {
         onValueChange={handleAccordionChange}
         className="space-y-3"
       >
+        {/* API Server Status */}
+        <AccordionItem value="server" id="section-server" className="border rounded-lg px-4 overflow-visible bg-card">
+          <AccordionTrigger className="hover:no-underline">
+            <div className="flex items-center gap-3">
+              <span className="material-icons-outlined text-muted-foreground">
+                dns
+              </span>
+              <div className="text-left">
+                <div className="font-semibold">API Server Status</div>
+                <div className="text-sm text-muted-foreground font-normal">
+                  Monitor and control the backend server
+                </div>
+              </div>
+            </div>
+          </AccordionTrigger>
+          <AccordionContent className="pt-4 pb-6 space-y-6">
+            <ServerStatusSection />
+          </AccordionContent>
+        </AccordionItem>
+
         {/* Device Connection */}
         <AccordionItem value="connection" id="section-connection" className="border rounded-lg px-4 overflow-visible bg-card">
           <AccordionTrigger className="hover:no-underline">
@@ -795,76 +1361,229 @@ export function SettingsPage() {
               )}
             </div>
 
-            {/* Port Selection */}
+            {/* Connection Type Selector */}
             <div className="space-y-3">
-              <Label>Available Serial Ports</Label>
-              <div className="flex gap-3">
-                <Select value={selectedPort} onValueChange={setSelectedPort}>
-                  <SelectTrigger className="flex-1">
-                    <SelectValue placeholder="Select a port..." />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {ports.length === 0 ? (
-                      <div className="py-6 text-center text-sm text-muted-foreground">
-                        No serial ports found
-                      </div>
+              <Label>Connection Type</Label>
+              <div className="flex gap-1 bg-muted rounded-lg p-1">
+                <button
+                  onClick={() => setConnectionType('serial')}
+                  disabled={isConnected}
+                  className={`flex-1 px-4 py-2 text-sm font-medium rounded transition-colors ${
+                    connectionType === 'serial'
+                      ? 'bg-background text-foreground shadow-sm'
+                      : 'text-muted-foreground hover:text-foreground'
+                  } ${isConnected ? 'opacity-50 cursor-not-allowed' : ''}`}
+                >
+                  Serial
+                </button>
+                <button
+                  onClick={() => setConnectionType('websocket')}
+                  disabled={isConnected}
+                  className={`flex-1 px-4 py-2 text-sm font-medium rounded transition-colors ${
+                    connectionType === 'websocket'
+                      ? 'bg-background text-foreground shadow-sm'
+                      : 'text-muted-foreground hover:text-foreground'
+                  } ${isConnected ? 'opacity-50 cursor-not-allowed' : ''}`}
+                >
+                  WebSocket
+                </button>
+              </div>
+            </div>
+
+            {/* Serial Port Selection */}
+            {connectionType === 'serial' && (
+              <div className="space-y-3">
+                <Label>Available Serial Ports</Label>
+                <div className="flex gap-3">
+                  <Select value={selectedPort} onValueChange={setSelectedPort} disabled={isConnected}>
+                    <SelectTrigger className="flex-1">
+                      <SelectValue placeholder="Select a port..." />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {ports.length === 0 ? (
+                        <div className="py-6 text-center text-sm text-muted-foreground">
+                          No serial ports found
+                        </div>
+                      ) : (
+                        ports.map((port) => (
+                          <SelectItem key={port} value={port}>
+                            {port}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectContent>
+                  </Select>
+                  <Button
+                    onClick={handleConnect}
+                    disabled={isLoading === 'connect' || !selectedPort || isConnected}
+                    className="gap-2"
+                  >
+                    {isLoading === 'connect' ? (
+                      <span className="material-icons-outlined animate-spin">sync</span>
                     ) : (
-                      ports.map((port) => (
-                        <SelectItem key={port} value={port}>
-                          {port}
-                        </SelectItem>
-                      ))
+                      <span className="material-icons-outlined">cable</span>
                     )}
-                  </SelectContent>
-                </Select>
+                    Connect
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Select a port and click 'Connect' to establish a connection.
+                </p>
+              </div>
+            )}
+
+            {/* WebSocket Configuration */}
+            {connectionType === 'websocket' && (
+              <div className="space-y-3">
+                <Label>WebSocket Configuration</Label>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <Label htmlFor="ws-host" className="text-xs">Host/IP Address</Label>
+                    <Input
+                      id="ws-host"
+                      value={websocketHost}
+                      onChange={(e) => setWebsocketHost(e.target.value)}
+                      disabled={isConnected}
+                      placeholder="fluidnc.local"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="ws-port" className="text-xs">Port</Label>
+                    <Input
+                      id="ws-port"
+                      type="number"
+                      value={websocketPort}
+                      onChange={(e) => setWebsocketPort(e.target.value)}
+                      disabled={isConnected}
+                      placeholder="81"
+                    />
+                  </div>
+                </div>
                 <Button
                   onClick={handleConnect}
-                  disabled={isLoading === 'connect' || !selectedPort || isConnected}
-                  className="gap-2"
+                  disabled={isLoading === 'connect' || !websocketHost || !websocketPort || isConnected}
+                  className="gap-2 w-full"
                 >
                   {isLoading === 'connect' ? (
                     <span className="material-icons-outlined animate-spin">sync</span>
                   ) : (
-                    <span className="material-icons-outlined">cable</span>
+                    <span className="material-icons-outlined">wifi</span>
                   )}
-                  Connect
+                  Connect via WebSocket
                 </Button>
+                <p className="text-xs text-muted-foreground">
+                  Enter the FluidNC WebSocket host and port (default: fluidnc.local:81)
+                </p>
               </div>
+            )}
+
+            {/* Frontend API Configuration */}
+            <div className="space-y-3">
+              <Label>Frontend API Configuration</Label>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label htmlFor="api-host" className="text-xs">Backend API Host</Label>
+                  <Input
+                    id="api-host"
+                    value={frontendApiHost}
+                    onChange={(e) => setFrontendApiHost(e.target.value)}
+                    placeholder="127.0.0.1"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="api-port" className="text-xs">Backend API Port</Label>
+                  <Input
+                    id="api-port"
+                    type="number"
+                    value={frontendApiPort}
+                    onChange={(e) => setFrontendApiPort(e.target.value)}
+                    placeholder="8080"
+                  />
+                </div>
+              </div>
+              <Button
+                onClick={handleSaveFrontendApiConfig}
+                disabled={isLoading === 'frontendApi'}
+                className="gap-2 w-full"
+              >
+                {isLoading === 'frontendApi' ? (
+                  <span className="material-icons-outlined animate-spin">sync</span>
+                ) : (
+                  <span className="material-icons-outlined">save</span>
+                )}
+                Save API Configuration
+              </Button>
               <p className="text-xs text-muted-foreground">
-                Select a port and click 'Connect' to establish a connection.
+                Configure where the frontend connects to the backend API (useful for development). Page will reload after saving.
               </p>
             </div>
 
             <Separator />
 
-            {/* Preferred Port for Auto-Connect */}
+            {/* Default Connection Method */}
             <div className="space-y-3">
-              <Label>Auto-Connect</Label>
-              <div className="flex gap-3">
-                <Select
-                  value={settings.preferred_port || '__auto__'}
-                  onValueChange={(value) =>
-                    setSettings({ ...settings, preferred_port: value === '__auto__' ? undefined : value })
-                  }
-                >
-                  <SelectTrigger className="flex-1">
-                    <SelectValue placeholder="Select auto-connect option..." />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__auto__">Auto (pick first available)</SelectItem>
-                    <SelectItem value="__none__">Disabled (no auto-connect)</SelectItem>
-                    {ports.length > 0 && (
-                      <>
-                        <div className="px-2 py-1.5 text-xs font-medium text-muted-foreground">Available Ports</div>
-                        {ports.map((port) => (
-                          <SelectItem key={port} value={port}>
-                            {port}
-                          </SelectItem>
-                        ))}
-                      </>
-                    )}
-                  </SelectContent>
-                </Select>
+              <Label>Default Connection</Label>
+              <div className="flex gap-3 items-start">
+                <div className="flex-1 space-y-3">
+                  <div className="flex gap-3 items-center">
+                    <Select
+                      value={settings.default_connection_method || 'serial'}
+                      onValueChange={(value) =>
+                        setSettings({ ...settings, default_connection_method: value })
+                      }
+                    >
+                      <SelectTrigger className="flex-1">
+                        <SelectValue placeholder="Select connection method..." />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="serial">Serial</SelectItem>
+                        <SelectItem value="websocket">WebSocket</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        id="auto-connect"
+                        checked={settings.auto_connect_enabled ?? true}
+                        onChange={(e) =>
+                          setSettings({ ...settings, auto_connect_enabled: e.target.checked })
+                        }
+                        className="h-4 w-4"
+                      />
+                      <Label htmlFor="auto-connect" className="text-sm cursor-pointer">
+                        Auto-connect
+                      </Label>
+                    </div>
+                  </div>
+
+                  {/* Show serial port selector when Serial is selected */}
+                  {settings.default_connection_method === 'serial' && (
+                    <div className="space-y-2">
+                      <Label className="text-xs">Preferred Serial Port</Label>
+                      <Select
+                        value={settings.preferred_port || ''}
+                        onValueChange={(value) =>
+                          setSettings({ ...settings, preferred_port: value || undefined })
+                        }
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select serial port..." />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {ports.length > 0 ? (
+                            ports.map((port) => (
+                              <SelectItem key={port} value={port}>
+                                {port}
+                              </SelectItem>
+                            ))
+                          ) : (
+                            <div className="px-2 py-1.5 text-xs text-muted-foreground">No ports available</div>
+                          )}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  )}
+                </div>
                 <Button
                   onClick={handleSavePreferredPort}
                   disabled={isLoading === 'preferredPort'}
@@ -879,7 +1598,13 @@ export function SettingsPage() {
                 </Button>
               </div>
               <p className="text-xs text-muted-foreground">
-                Choose how the system connects on startup: Auto picks the first available port, Disabled requires manual connection, or select a specific port.
+                {settings.auto_connect_enabled
+                  ? settings.default_connection_method === 'serial'
+                    ? settings.preferred_port
+                      ? `Will auto-connect to ${settings.preferred_port} on startup`
+                      : 'Select a serial port to enable auto-connect'
+                    : `Will auto-connect to ${websocketHost}:${websocketPort} on startup`
+                  : 'Auto-connect disabled - manual connection required'}
               </p>
             </div>
           </AccordionContent>
@@ -1256,6 +1981,279 @@ export function SettingsPage() {
                 This name appears in the browser tab and header.
               </p>
             </div>
+
+            <Separator />
+
+            {/* Cache Worker Count */}
+            <div className="space-y-3">
+              <Label htmlFor="cacheWorkerCount">Cache Generation Worker Threads</Label>
+              <div className="flex gap-3">
+                <Input
+                  id="cacheWorkerCount"
+                  type="number"
+                  min="1"
+                  max="128"
+                  value={settings.cache_worker_count || ''}
+                  onChange={(e) =>
+                    setSettings({ ...settings, cache_worker_count: parseInt(e.target.value) || 1 })
+                  }
+                  placeholder="Number of worker threads"
+                  className="flex-1"
+                />
+                <Button
+                  onClick={async () => {
+                    try {
+                      setIsLoading('cacheWorkerCount')
+                      await apiClient.post('/api/settings', {
+                        app: { cache_worker_count: settings.cache_worker_count }
+                      })
+                      toast.success('Worker count updated')
+                    } catch (error: any) {
+                      toast.error(error?.message || 'Failed to update worker count')
+                    } finally {
+                      setIsLoading(null)
+                    }
+                  }}
+                  disabled={isLoading === 'cacheWorkerCount'}
+                  className="gap-2"
+                >
+                  {isLoading === 'cacheWorkerCount' ? (
+                    <span className="material-icons-outlined animate-spin">sync</span>
+                  ) : (
+                    <span className="material-icons-outlined">save</span>
+                  )}
+                  Save
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Number of parallel threads to use for cache generation (preview images, metadata, and duration calculation). Higher values speed up cache generation but use more CPU. Default is your CPU core count.
+              </p>
+            </div>
+
+            <Separator />
+
+            {/* Duration Cache Management */}
+            <div className="space-y-3">
+              <Label>Pattern Duration Calculation</Label>
+              <div className="space-y-4 p-4 rounded-lg border">
+                {/* Status Display */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">Status</span>
+                    <span className={`text-sm font-medium ${
+                      durationCacheStatus.is_calculating
+                        ? durationCacheStatus.is_paused
+                          ? 'text-yellow-500'
+                          : 'text-green-500'
+                        : 'text-muted-foreground'
+                    }`}>
+                      {durationCacheStatus.is_calculating
+                        ? durationCacheStatus.is_paused
+                          ? 'Paused'
+                          : 'Calculating...'
+                        : 'Idle'}
+                    </span>
+                  </div>
+
+                  {durationCacheStatus.is_calculating && (
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-xs text-muted-foreground">
+                        <span>Progress</span>
+                        <span>
+                          {durationCacheStatus.calculated_patterns} / {durationCacheStatus.total_patterns} patterns
+                        </span>
+                      </div>
+                      <div className="w-full bg-muted rounded-full h-2 overflow-hidden">
+                        <div
+                          className="h-full bg-primary transition-all duration-300"
+                          style={{
+                            width: `${
+                              durationCacheStatus.total_patterns > 0
+                                ? (durationCacheStatus.calculated_patterns / durationCacheStatus.total_patterns) * 100
+                                : 0
+                            }%`
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>Cached Patterns</span>
+                    <span>{durationCacheStatus.cache_size} patterns</span>
+                  </div>
+                </div>
+
+                {/* Control Buttons */}
+                <div className="flex flex-wrap gap-2">
+                  {!durationCacheStatus.is_calculating ? (
+                    <Button
+                      onClick={handleStartDurationCache}
+                      disabled={isLoading === 'duration-cache'}
+                      size="sm"
+                      className="gap-2"
+                    >
+                      {isLoading === 'duration-cache' ? (
+                        <span className="material-icons-outlined animate-spin text-base">sync</span>
+                      ) : (
+                        <span className="material-icons-outlined text-base">play_arrow</span>
+                      )}
+                      Start Calculation
+                    </Button>
+                  ) : (
+                    <>
+                      {durationCacheStatus.is_paused ? (
+                        <Button
+                          onClick={handleResumeDurationCache}
+                          disabled={isLoading === 'duration-cache'}
+                          size="sm"
+                          className="gap-2"
+                        >
+                          <span className="material-icons-outlined text-base">play_arrow</span>
+                          Resume
+                        </Button>
+                      ) : (
+                        <Button
+                          onClick={handlePauseDurationCache}
+                          disabled={isLoading === 'duration-cache'}
+                          size="sm"
+                          variant="secondary"
+                          className="gap-2"
+                        >
+                          <span className="material-icons-outlined text-base">pause</span>
+                          Pause
+                        </Button>
+                      )}
+                      <Button
+                        onClick={handleStopDurationCache}
+                        disabled={isLoading === 'duration-cache'}
+                        size="sm"
+                        variant="secondary"
+                        className="gap-2"
+                      >
+                        <span className="material-icons-outlined text-base">stop</span>
+                        Stop
+                      </Button>
+                    </>
+                  )}
+                  <Button
+                    onClick={handleClearDurationCache}
+                    disabled={isLoading === 'duration-cache' || durationCacheStatus.is_calculating}
+                    size="sm"
+                    variant="destructive"
+                    className="gap-2"
+                  >
+                    <span className="material-icons-outlined text-base">delete</span>
+                    Clear Cache
+                  </Button>
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Pre-calculate estimated run times for all patterns. This process runs in the background and doesn't affect normal operations.
+              </p>
+            </div>
+
+            <Separator />
+
+            {/* Preview Cache Management */}
+            <div className="space-y-3">
+              <Label>Pattern Preview Cache</Label>
+              <div className="space-y-4 p-4 rounded-lg border">
+                {/* Status Display */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">Status</span>
+                    <span className={`text-sm font-medium ${
+                      previewCacheStatus.is_running
+                        ? 'text-green-500'
+                        : previewCacheStatus.error
+                        ? 'text-destructive'
+                        : 'text-muted-foreground'
+                    }`}>
+                      {previewCacheStatus.is_running
+                        ? previewCacheStatus.stage === 'metadata'
+                          ? 'Generating Metadata...'
+                          : previewCacheStatus.stage === 'images'
+                          ? 'Generating Previews...'
+                          : 'Starting...'
+                        : previewCacheStatus.error
+                        ? 'Error'
+                        : 'Idle'}
+                    </span>
+                  </div>
+
+                  {previewCacheStatus.is_running && (
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-xs text-muted-foreground">
+                        <span>Progress</span>
+                        <span>
+                          {Math.round((previewCacheStatus.processed_files / previewCacheStatus.total_files) * 100)}% of {previewCacheStatus.pattern_count} patterns
+                        </span>
+                      </div>
+                      <div className="w-full bg-muted rounded-full h-2 overflow-hidden">
+                        <div
+                          className="h-full bg-primary transition-all duration-300"
+                          style={{
+                            width: `${
+                              previewCacheStatus.total_files > 0
+                                ? (previewCacheStatus.processed_files / previewCacheStatus.total_files) * 100
+                                : 0
+                            }%`
+                          }}
+                        />
+                      </div>
+                      {previewCacheStatus.current_file && (
+                        <div className="text-xs text-muted-foreground truncate">
+                          Current: {previewCacheStatus.current_file}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {previewCacheStatus.error && (
+                    <Alert variant="destructive" className="mt-2">
+                      <span className="material-icons-outlined text-base">error</span>
+                      <AlertDescription>{previewCacheStatus.error}</AlertDescription>
+                    </Alert>
+                  )}
+
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>Cached Previews</span>
+                    <span>{previewCacheStatus.cache_size} patterns</span>
+                  </div>
+                </div>
+
+                {/* Control Buttons */}
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    onClick={handleStartPreviewCache}
+                    disabled={isLoading === 'preview-cache' || previewCacheStatus.is_running}
+                    size="sm"
+                    className="gap-2"
+                  >
+                    {isLoading === 'preview-cache' ? (
+                      <span className="material-icons-outlined animate-spin text-base">sync</span>
+                    ) : (
+                      <span className="material-icons-outlined text-base">refresh</span>
+                    )}
+                    Regenerate Cache
+                  </Button>
+                  <Button
+                    onClick={handleClearPreviewCache}
+                    disabled={isLoading === 'preview-cache' || previewCacheStatus.is_running}
+                    size="sm"
+                    variant="destructive"
+                    className="gap-2"
+                  >
+                    <span className="material-icons-outlined text-base">delete</span>
+                    Clear Cache
+                  </Button>
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Generate preview images for all pattern files. This process runs in the background using multiple threads for faster generation. Previews are used in the Browse page and hover tooltips.
+              </p>
+            </div>
           </AccordionContent>
         </AccordionItem>
 
@@ -1355,6 +2353,59 @@ export function SettingsPage() {
               </div>
             </div>
 
+            {/* Post-Execution Command */}
+            <div className="p-4 rounded-lg border space-y-3">
+              <h4 className="font-medium">Post-Execution Action</h4>
+              <p className="text-sm text-muted-foreground">
+                Run a shell command after each pattern completes successfully. Useful for capturing snapshots for
+                stop-motion animations.
+              </p>
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="post-execution-enabled"
+                    checked={settings.post_execution_enabled || false}
+                    onChange={(e) =>
+                      setSettings({
+                        ...settings,
+                        post_execution_enabled: e.target.checked,
+                      })
+                    }
+                    className="w-4 h-4"
+                  />
+                  <Label htmlFor="post-execution-enabled" className="cursor-pointer">
+                    Enable Post-Execution Commands
+                  </Label>
+                </div>
+
+                {settings.post_execution_enabled && (
+                  <>
+                    <Label htmlFor="post-execution-command">Shell Command</Label>
+                    <Input
+                      id="post-execution-command"
+                      type="text"
+                      value={settings.post_execution_command || ''}
+                      onChange={(e) =>
+                        setSettings({
+                          ...settings,
+                          post_execution_command: e.target.value,
+                        })
+                      }
+                      placeholder="e.g., ffmpeg -i http://camera/snapshot.jpg output_%04d.jpg"
+                      className="font-mono text-sm"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Example: <code className="bg-muted px-1 py-0.5 rounded">ffmpeg -i http://192.168.1.100/snapshot -y /path/to/frame_%04d.jpg</code>
+                    </p>
+                    <p className="text-xs text-amber-600">
+                      ⚠️ Commands execute with shell access - use with caution. Timeout: 30 seconds.
+                    </p>
+                  </>
+                )}
+              </div>
+            </div>
+
             <Button
               onClick={handleSaveClearingSettings}
               disabled={isLoading === 'clearing'}
@@ -1365,7 +2416,7 @@ export function SettingsPage() {
               ) : (
                 <span className="material-icons-outlined">save</span>
               )}
-              Save Clearing Settings
+              Save Pattern Settings
             </Button>
           </AccordionContent>
         </AccordionItem>
@@ -1426,6 +2477,38 @@ export function SettingsPage() {
                 <p className="text-xs text-muted-foreground">
                   Enter the IP address of your WLED controller
                 </p>
+
+                <Separator />
+
+                <div className="flex items-center justify-between">
+                  <div className="space-y-1">
+                    <Label>Return WLED to previous state after connect</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Restore WLED settings after connection animation completes
+                    </p>
+                  </div>
+                  <Switch
+                    checked={ledConfig.wled_restore_state_on_connect ?? true}
+                    onCheckedChange={(checked) =>
+                      setLedConfig({ ...ledConfig, wled_restore_state_on_connect: checked })
+                    }
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div className="space-y-1">
+                    <Label>Turn off WLED on Dune Weaver exit</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Power off the WLED device when exiting the application
+                    </p>
+                  </div>
+                  <Switch
+                    checked={ledConfig.wled_power_off_on_exit ?? false}
+                    onCheckedChange={(checked) =>
+                      setLedConfig({ ...ledConfig, wled_power_off_on_exit: checked })
+                    }
+                  />
+                </div>
               </div>
             )}
 

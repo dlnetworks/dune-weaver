@@ -281,7 +281,6 @@ class TestTableMovement:
         if not run_hardware:
             pytest.skip("Hardware tests disabled")
 
-        from httpx import Client
         from modules.connection import connection_manager
         from modules.core.state import state
 

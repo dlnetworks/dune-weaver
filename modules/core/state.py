@@ -42,6 +42,17 @@ class AppState:
         self.playlist_mode = "loop"
         self.pause_time_remaining = 0
         self.active_clear_pattern = None  # Runtime: clear pattern mode for current playlist (not persisted)
+
+        # Actual position tracking (queried from FluidNC, not persisted)
+        self.actual_theta = 0  # Real-time theta from FluidNC position query
+        self.actual_rho = 0  # Real-time rho from FluidNC position query
+        self.enable_actual_position_tracking = False  # Enable/disable real-time position polling
+        self.actual_position_tracking_task = None  # Background task handle
+        # Reference position for inverse coordinate conversion
+        self.reference_theta = 0  # Theta at pattern start (for inverse conversion)
+        self.reference_rho = 0  # Rho at pattern start (for inverse conversion)
+        self.reference_machine_x = 0  # Machine X at pattern start (for inverse conversion)
+        self.reference_machine_y = 0  # Machine Y at pattern start (for inverse conversion)
         
         # Machine position variables
         self.machine_x = 0.0
@@ -87,10 +98,26 @@ class AppState:
         self.mqtt_handler = None  # Will be set by the MQTT handler
         self.conn = None
         self.port = None
-        self.preferred_port = None  # User's preferred port for auto-connect
+        self.preferred_port = None  # User's preferred serial port for auto-connect
+
+        # Connection type: "serial" or "websocket"
+        self.connection_type = "serial"  # Default to serial
+
+        # WebSocket connection settings
+        self.websocket_host = "fluidnc.local"  # Default FluidNC hostname
+        self.websocket_port = 81  # Default FluidNC WebSocket port
+
+        # Auto-connect settings
+        self.auto_connect_enabled = True  # Enable auto-connect on startup
+        self.default_connection_method = "serial"  # Default method: "serial" or "websocket"
+
         self.wled_ip = None
         self.led_provider = "none"  # "wled", "dw_leds", or "none"
         self.led_controller = None
+
+        # WLED behavior settings
+        self.wled_restore_state_on_connect = True  # Restore WLED to previous state after connection animations
+        self.wled_power_off_on_exit = False  # Turn off WLED when application exits
 
         # DW LED settings
         self.dw_led_num_leds = 60  # Number of LEDs in strip
@@ -119,9 +146,15 @@ class AppState:
         self._shuffle = False  # Shuffle playlist order
         self.custom_clear_from_in = None  # Custom clear from center pattern
         self.custom_clear_from_out = None  # Custom clear from perimeter pattern
-        
+        self.post_execution_command = None  # Shell command to run after pattern completes
+        self.post_execution_enabled = False  # Enable/disable post-execution commands
+
         # Application name setting
         self.app_name = "Dune Weaver"  # Default app name
+
+        # Cache generation settings
+        import multiprocessing
+        self.cache_worker_count = multiprocessing.cpu_count()  # Default to CPU count
 
         # Multi-table identity (for network discovery)
         self.table_id = str(uuid.uuid4())  # UUID generated on first run, persistent across restarts
@@ -152,6 +185,11 @@ class AppState:
 
         # Server port setting (requires restart to take effect)
         self.server_port = 8080  # Default server port
+
+        # Frontend API connection settings (for connecting to backend from frontend dev server)
+        # These are used by the frontend when running separately from the backend
+        self.frontend_api_host = "127.0.0.1"  # Backend API host
+        self.frontend_api_port = 8080  # Backend API port
 
         # Machine timezone setting (IANA timezone, e.g., "America/New_York", "UTC")
         # Used for logging timestamps and scheduling features
@@ -472,10 +510,19 @@ class AppState:
             "shuffle": self._shuffle,
             "custom_clear_from_in": self.custom_clear_from_in,
             "custom_clear_from_out": self.custom_clear_from_out,
+            "post_execution_command": self.post_execution_command,
+            "post_execution_enabled": self.post_execution_enabled,
             "port": self.port,
             "preferred_port": self.preferred_port,
+            "connection_type": self.connection_type,
+            "websocket_host": self.websocket_host,
+            "websocket_port": self.websocket_port,
+            "auto_connect_enabled": self.auto_connect_enabled,
+            "default_connection_method": self.default_connection_method,
             "wled_ip": self.wled_ip,
             "led_provider": self.led_provider,
+            "wled_restore_state_on_connect": self.wled_restore_state_on_connect,
+            "wled_power_off_on_exit": self.wled_power_off_on_exit,
             "dw_led_num_leds": self.dw_led_num_leds,
             "dw_led_gpio_pin": self.dw_led_gpio_pin,
             "dw_led_pixel_order": self.dw_led_pixel_order,
@@ -487,6 +534,7 @@ class AppState:
             "dw_led_idle_timeout_enabled": self.dw_led_idle_timeout_enabled,
             "dw_led_idle_timeout_minutes": self.dw_led_idle_timeout_minutes,
             "app_name": self.app_name,
+            "cache_worker_count": self.cache_worker_count,
             "table_id": self.table_id,
             "table_name": self.table_name,
             "known_tables": self.known_tables,
@@ -503,6 +551,8 @@ class AppState:
             "scheduled_pause_finish_pattern": self.scheduled_pause_finish_pattern,
             "scheduled_pause_timezone": self.scheduled_pause_timezone,
             "timezone": self.timezone,
+            "frontend_api_host": self.frontend_api_host,
+            "frontend_api_port": self.frontend_api_port,
             "mqtt_enabled": self.mqtt_enabled,
             "mqtt_broker": self.mqtt_broker,
             "mqtt_port": self.mqtt_port,
@@ -546,10 +596,19 @@ class AppState:
         self._shuffle = data.get("shuffle", False)
         self.custom_clear_from_in = data.get("custom_clear_from_in", None)
         self.custom_clear_from_out = data.get("custom_clear_from_out", None)
+        self.post_execution_command = data.get("post_execution_command", None)
+        self.post_execution_enabled = data.get("post_execution_enabled", False)
         self.port = data.get("port", None)
         self.preferred_port = data.get("preferred_port", None)
+        self.connection_type = data.get("connection_type", "serial")
+        self.websocket_host = data.get("websocket_host", "fluidnc.local")
+        self.websocket_port = data.get("websocket_port", 81)
+        self.auto_connect_enabled = data.get("auto_connect_enabled", True)
+        self.default_connection_method = data.get("default_connection_method", "serial")
         self.wled_ip = data.get('wled_ip', None)
         self.led_provider = data.get('led_provider', "none")
+        self.wled_restore_state_on_connect = data.get('wled_restore_state_on_connect', True)
+        self.wled_power_off_on_exit = data.get('wled_power_off_on_exit', False)
         self.dw_led_num_leds = data.get('dw_led_num_leds', 60)
         self.dw_led_gpio_pin = data.get('dw_led_gpio_pin', 18)
         self.dw_led_pixel_order = data.get('dw_led_pixel_order', "RGB")
@@ -579,6 +638,8 @@ class AppState:
         self.dw_led_idle_timeout_minutes = data.get('dw_led_idle_timeout_minutes', 30)
 
         self.app_name = data.get("app_name", "Dune Weaver")
+        import multiprocessing
+        self.cache_worker_count = data.get("cache_worker_count", multiprocessing.cpu_count())
         # Load or generate table_id (UUID persisted once generated)
         self.table_id = data.get("table_id", None)
         if self.table_id is None:
@@ -598,6 +659,8 @@ class AppState:
         self.scheduled_pause_finish_pattern = data.get("scheduled_pause_finish_pattern", False)
         self.scheduled_pause_timezone = data.get("scheduled_pause_timezone", None)
         self.timezone = data.get("timezone", "UTC")
+        self.frontend_api_host = data.get("frontend_api_host", "127.0.0.1")
+        self.frontend_api_port = data.get("frontend_api_port", 8080)
         self.mqtt_enabled = data.get("mqtt_enabled", False)
         self.mqtt_broker = data.get("mqtt_broker", "")
         self.mqtt_port = data.get("mqtt_port", 1883)

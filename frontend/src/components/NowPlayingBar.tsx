@@ -62,6 +62,9 @@ interface PlaybackStatus {
   connection_status: boolean
   current_theta: number
   current_rho: number
+  actual_theta: number
+  actual_rho: number
+  enable_actual_position_tracking: boolean
 }
 
 function formatTime(seconds: number): string {
@@ -329,6 +332,25 @@ export function NowPlayingBar({ isLogsOpen = false, logsDrawerHeight = 256, isVi
   const lastProgressTimeRef = useRef<number>(0)
   const smoothProgressRef = useRef<number>(0)
 
+  // Actual position tracking refs
+  const actualPositionHistoryRef = useRef<Coordinate[]>([])
+  const lastActualPositionRef = useRef<{ theta: number; rho: number } | null>(null)
+
+  // Preview mode state: 'expected', 'actual', or 'both'
+  const [previewMode, setPreviewMode] = useState<'expected' | 'actual' | 'both'>('expected')
+
+  // Toggle actual position tracking when preview mode changes
+  const handlePreviewModeChange = async (mode: 'expected' | 'actual' | 'both') => {
+    setPreviewMode(mode)
+    const enableTracking = mode === 'actual' || mode === 'both'
+    try {
+      await apiClient.post('/api/toggle_actual_position_tracking', { enable: enableTracking })
+    } catch (error) {
+      console.error('Failed to toggle actual position tracking:', error)
+      toast.error('Failed to toggle position tracking')
+    }
+  }
+
   // Connect to status WebSocket (reconnects when table changes)
   useEffect(() => {
     let reconnectTimeout: ReturnType<typeof setTimeout> | null = null
@@ -512,7 +534,7 @@ export function NowPlayingBar({ isLogsOpen = false, logsDrawerHeight = 256, isVi
     lastThemeRef.current = colors.isDark
   }, [getThemeColors, polarToCartesian])
 
-  const drawPattern = useCallback((ctx: CanvasRenderingContext2D, coords: Coordinate[], smoothIndex: number, forceRedraw = false) => {
+  const drawPattern = useCallback((ctx: CanvasRenderingContext2D, coords: Coordinate[], smoothIndex: number, actualPos: Coordinate | null, mode: 'expected' | 'actual' | 'both', forceRedraw = false) => {
     const canvas = ctx.canvas
     const size = canvas.width
     const colors = getThemeColors()
@@ -528,6 +550,7 @@ export function NowPlayingBar({ isLogsOpen = false, logsDrawerHeight = 256, isVi
 
     if (needsReinit) {
       initOffscreenCanvas(size, coords)
+      actualPositionHistoryRef.current = []
     }
 
     const offscreen = offscreenCanvasRef.current
@@ -536,8 +559,9 @@ export function NowPlayingBar({ isLogsOpen = false, logsDrawerHeight = 256, isVi
     const offCtx = offscreen.getContext('2d')
     if (!offCtx) return
 
-    if (coords.length > 0 && adjustedIndex > lastDrawnIndexRef.current) {
-      offCtx.strokeStyle = colors.lineColor
+    // Draw expected path (blue)
+    if ((mode === 'expected' || mode === 'both') && coords.length > 0 && adjustedIndex > lastDrawnIndexRef.current) {
+      offCtx.strokeStyle = mode === 'both' ? '#3b82f6' : colors.lineColor
       offCtx.lineWidth = 1.5
       offCtx.lineCap = 'round'
       offCtx.lineJoin = 'round'
@@ -559,10 +583,30 @@ export function NowPlayingBar({ isLogsOpen = false, logsDrawerHeight = 256, isVi
       lastDrawnIndexRef.current = adjustedIndex
     }
 
+    // Draw actual path (green) from history
+    if ((mode === 'actual' || mode === 'both') && actualPositionHistoryRef.current.length > 1) {
+      offCtx.strokeStyle = '#22c55e'
+      offCtx.lineWidth = 1.5
+      offCtx.lineCap = 'round'
+      offCtx.lineJoin = 'round'
+
+      offCtx.beginPath()
+      const firstActual = actualPositionHistoryRef.current[0]
+      const firstPoint = polarToCartesian(firstActual[0], firstActual[1], size)
+      offCtx.moveTo(firstPoint.x, firstPoint.y)
+
+      for (let i = 1; i < actualPositionHistoryRef.current.length; i++) {
+        const coord = actualPositionHistoryRef.current[i]
+        const point = polarToCartesian(coord[0], coord[1], size)
+        offCtx.lineTo(point.x, point.y)
+      }
+      offCtx.stroke()
+    }
+
     ctx.drawImage(offscreen, 0, 0)
 
-    // Draw current position marker with smooth interpolation between coordinates
-    if (coords.length > 0 && adjustedIndex < coords.length - 1) {
+    // Draw expected position marker (blue) with smooth interpolation
+    if ((mode === 'expected' || mode === 'both') && coords.length > 0 && adjustedIndex < coords.length - 1) {
       const fraction = adjustedSmoothIndex - adjustedIndex
       const currentCoord = coords[adjustedIndex]
       const nextCoord = coords[Math.min(adjustedIndex + 1, coords.length - 1)]
@@ -574,17 +618,29 @@ export function NowPlayingBar({ isLogsOpen = false, logsDrawerHeight = 256, isVi
       const currentPoint = polarToCartesian(interpTheta, interpRho, size)
       ctx.beginPath()
       ctx.arc(currentPoint.x, currentPoint.y, 8, 0, Math.PI * 2)
-      ctx.fillStyle = '#0b80ee'
+      ctx.fillStyle = mode === 'both' ? '#3b82f6' : '#0b80ee'
       ctx.fill()
       ctx.strokeStyle = colors.markerBorder
       ctx.lineWidth = 2
       ctx.stroke()
-    } else if (coords.length > 0 && adjustedIndex < coords.length) {
+    } else if ((mode === 'expected' || mode === 'both') && coords.length > 0 && adjustedIndex < coords.length) {
       // At the last coordinate, just draw without interpolation
       const currentPoint = polarToCartesian(coords[adjustedIndex][0], coords[adjustedIndex][1], size)
       ctx.beginPath()
       ctx.arc(currentPoint.x, currentPoint.y, 8, 0, Math.PI * 2)
-      ctx.fillStyle = '#0b80ee'
+      ctx.fillStyle = mode === 'both' ? '#3b82f6' : '#0b80ee'
+      ctx.fill()
+      ctx.strokeStyle = colors.markerBorder
+      ctx.lineWidth = 2
+      ctx.stroke()
+    }
+
+    // Draw actual position marker (green)
+    if ((mode === 'actual' || mode === 'both') && actualPos) {
+      const actualPoint = polarToCartesian(actualPos[0], actualPos[1], size)
+      ctx.beginPath()
+      ctx.arc(actualPoint.x, actualPoint.y, 8, 0, Math.PI * 2)
+      ctx.fillStyle = '#22c55e'
       ctx.fill()
       ctx.strokeStyle = colors.markerBorder
       ctx.lineWidth = 2
@@ -663,7 +719,13 @@ export function NowPlayingBar({ isLogsOpen = false, logsDrawerHeight = 256, isVi
       }
 
       smoothProgressRef.current = smoothIndex
-      drawPattern(ctx, coordinates, smoothIndex)
+
+      // Get actual position from status
+      const actualPos: Coordinate | null = (status?.actual_theta !== undefined && status?.actual_rho !== undefined)
+        ? [status.actual_theta, status.actual_rho]
+        : null
+
+      drawPattern(ctx, coordinates, smoothIndex, actualPos, previewMode)
 
       animationFrameRef.current = requestAnimationFrame(animate)
     }
@@ -679,7 +741,11 @@ export function NowPlayingBar({ isLogsOpen = false, logsDrawerHeight = 256, isVi
       smoothProgressRef.current = getTargetIndex(coordinates)
       lastProgressTimeRef.current = performance.now()
 
-      drawPattern(ctx, coordinates, smoothProgressRef.current, true)
+      const actualPos: Coordinate | null = (status?.actual_theta !== undefined && status?.actual_rho !== undefined)
+        ? [status.actual_theta, status.actual_rho]
+        : null
+
+      drawPattern(ctx, coordinates, smoothProgressRef.current, actualPos, previewMode, true)
 
       // Start animation loop
       animationFrameRef.current = requestAnimationFrame(animate)
@@ -691,7 +757,37 @@ export function NowPlayingBar({ isLogsOpen = false, logsDrawerHeight = 256, isVi
         cancelAnimationFrame(animationFrameRef.current)
       }
     }
-  }, [isExpanded, coordinates, status?.is_paused, drawPattern, getTargetIndex])
+  }, [isExpanded, coordinates, status?.is_paused, status?.actual_theta, status?.actual_rho, previewMode, drawPattern, getTargetIndex])
+
+  // Track actual position history (for drawing actual position trail)
+  // Clear when pattern changes, but keep full history for current pattern
+  const currentFileRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    // Clear history when pattern changes or stops
+    if (status?.current_file !== currentFileRef.current) {
+      actualPositionHistoryRef.current = []
+      lastActualPositionRef.current = null
+      currentFileRef.current = status?.current_file || null
+    }
+
+    if (!status?.current_file) {
+      return
+    }
+
+    if (status.actual_theta !== undefined && status.actual_rho !== undefined) {
+      const currentActual = { theta: status.actual_theta, rho: status.actual_rho }
+
+      // Only add if position changed significantly (avoid duplicates)
+      if (!lastActualPositionRef.current ||
+          Math.abs(currentActual.theta - lastActualPositionRef.current.theta) > 0.01 ||
+          Math.abs(currentActual.rho - lastActualPositionRef.current.rho) > 0.01) {
+
+        actualPositionHistoryRef.current.push([currentActual.theta, currentActual.rho])
+        lastActualPositionRef.current = currentActual
+      }
+    }
+  }, [status?.actual_theta, status?.actual_rho, status?.current_file])
 
   const handlePause = async () => {
     try {
@@ -1269,6 +1365,57 @@ export function NowPlayingBar({ isLogsOpen = false, logsDrawerHeight = 256, isVi
                     )}
                   </div>
                 </div>
+
+                {/* Preview Mode Selector */}
+                {!isWaiting && (
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-xs text-muted-foreground font-medium">Preview Mode</label>
+                    <div className="flex gap-1 bg-muted rounded-lg p-1">
+                      <button
+                        onClick={() => handlePreviewModeChange('expected')}
+                        className={`flex-1 px-2 py-1.5 text-xs font-medium rounded transition-colors ${
+                          previewMode === 'expected'
+                            ? 'bg-background text-foreground shadow-sm'
+                            : 'text-muted-foreground hover:text-foreground'
+                        }`}
+                      >
+                        Expected
+                      </button>
+                      <button
+                        onClick={() => handlePreviewModeChange('actual')}
+                        className={`flex-1 px-2 py-1.5 text-xs font-medium rounded transition-colors ${
+                          previewMode === 'actual'
+                            ? 'bg-background text-foreground shadow-sm'
+                            : 'text-muted-foreground hover:text-foreground'
+                        }`}
+                      >
+                        Actual
+                      </button>
+                      <button
+                        onClick={() => handlePreviewModeChange('both')}
+                        className={`flex-1 px-2 py-1.5 text-xs font-medium rounded transition-colors ${
+                          previewMode === 'both'
+                            ? 'bg-background text-foreground shadow-sm'
+                            : 'text-muted-foreground hover:text-foreground'
+                        }`}
+                      >
+                        Both
+                      </button>
+                    </div>
+                    {previewMode !== 'expected' && (
+                      <p className="text-[10px] text-muted-foreground">
+                        <span className="inline-block w-2 h-2 rounded-full bg-blue-500 mr-1"></span>
+                        Expected
+                        {previewMode === 'both' && (
+                          <>
+                            <span className="inline-block w-2 h-2 rounded-full bg-green-500 ml-2 mr-1"></span>
+                            Actual
+                          </>
+                        )}
+                      </p>
+                    )}
+                  </div>
+                )}
 
                 {/* Progress */}
                 {isWaiting ? (

@@ -16,6 +16,7 @@ tsconfig.json
 # Touch app config files
 dune-weaver-touch/*.json
 .venv/
+patterns/
 patterns/cached_svg/
 patterns/cached_images/custom_*
 # macOS files
@@ -29,6 +30,7 @@ node_modules/
 static/custom/*
 !static/custom/.gitkeep
 .claude/
+CLAUDE.md
 static/dist/
 .planning/
 .coverage

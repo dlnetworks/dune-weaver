@@ -1,6 +1,5 @@
 """Factory for creating MQTT handlers."""
 import os
-from typing import Dict, Callable
 from dotenv import load_dotenv
 from pathlib import Path
 from .base import BaseMQTTHandler

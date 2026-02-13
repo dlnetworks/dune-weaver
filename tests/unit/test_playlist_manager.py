@@ -12,7 +12,7 @@ Tests the core playlist management functions:
 """
 import json
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 
 class TestPlaylistManagerCRUD:

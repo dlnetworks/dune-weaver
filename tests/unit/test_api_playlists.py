@@ -12,7 +12,7 @@ Tests the following endpoints:
 - POST /run_playlist (when disconnected)
 """
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock
 
 
 class TestListAllPlaylists:

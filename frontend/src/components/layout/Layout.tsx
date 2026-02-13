@@ -14,6 +14,8 @@ import ShinyText from '@/components/ShinyText'
 const navItems = [
   { path: '/', label: 'Browse', icon: 'grid_view', title: 'Browse Patterns' },
   { path: '/playlists', label: 'Playlists', icon: 'playlist_play', title: 'Playlists' },
+  { path: '/history', label: 'History', icon: 'history', title: 'Execution History' },
+  { path: '/studio', label: 'Studio', icon: 'draw', title: 'Pattern Studio' },
   { path: '/table-control', label: 'Control', icon: 'tune', title: 'Table Control' },
   { path: '/led', label: 'LED', icon: 'lightbulb', title: 'LED Control' },
   { path: '/settings', label: 'Settings', icon: 'settings', title: 'Settings' },
@@ -734,6 +736,8 @@ export function Layout() {
     processed_files: number
     total_files: number
     current_file: string
+    image_total: number
+    image_processed: number
     error?: string
   } | null>(null)
   const cacheWsRef = useRef<WebSocket | null>(null)
@@ -974,23 +978,14 @@ export function Layout() {
     }
   }, [isBackendConnected]) // Only reconnect based on backend connection, not cache state
 
-  // Calculate cache progress percentage
-  const cachePercentage = cacheProgress?.total_files
-    ? Math.round((cacheProgress.processed_files / cacheProgress.total_files) * 100)
+  // Calculate cache progress percentage - only for image phase in overlay
+  const cachePercentage = cacheProgress?.image_total
+    ? Math.round((cacheProgress.image_processed / cacheProgress.image_total) * 100)
     : 0
 
   const getCacheStageText = () => {
     if (!cacheProgress) return ''
-    switch (cacheProgress.stage) {
-      case 'starting':
-        return 'Initializing...'
-      case 'metadata':
-        return 'Processing pattern metadata'
-      case 'images':
-        return 'Generating pattern previews'
-      default:
-        return 'Processing...'
-    }
+    return 'Generating pattern previews'
   }
 
   // Cache all previews in browser using IndexedDB
@@ -1219,8 +1214,8 @@ export function Layout() {
         </div>
       )}
 
-      {/* Cache Progress Blocking Overlay */}
-      {cacheProgress?.is_running && (
+      {/* Cache Progress Blocking Overlay - Only show during image generation phase */}
+      {cacheProgress?.is_running && cacheProgress.stage === 'images' && (
         <div className="fixed inset-0 z-50 bg-background/95 backdrop-blur-sm flex flex-col items-center justify-center p-4">
           <div className="w-full max-w-md space-y-6">
             <div className="text-center space-y-4">
@@ -1229,9 +1224,9 @@ export function Layout() {
                   cached
                 </span>
               </div>
-              <h2 className="text-2xl font-bold">Initializing Pattern Cache</h2>
+              <h2 className="text-2xl font-bold">Generating Pattern Previews</h2>
               <p className="text-muted-foreground">
-                Preparing your pattern previews...
+                Creating preview images for your patterns...
               </p>
             </div>
 
@@ -1245,7 +1240,7 @@ export function Layout() {
               </div>
               <div className="flex justify-between text-sm text-muted-foreground">
                 <span>
-                  {cacheProgress.processed_files} of {cacheProgress.total_files} patterns
+                  {cacheProgress.image_processed} of {cacheProgress.image_total} patterns
                 </span>
                 <span>{cachePercentage}%</span>
               </div>
@@ -1904,7 +1899,7 @@ export function Layout() {
 
       {/* Bottom Navigation */}
       <nav className="fixed bottom-0 left-0 right-0 z-40 border-t border-border bg-card pb-safe">
-        <div className="max-w-5xl mx-auto grid grid-cols-5 h-16">
+        <div className="max-w-5xl mx-auto grid grid-cols-7 h-16">
           {navItems.map((item) => {
             const isActive = location.pathname === item.path
             return (

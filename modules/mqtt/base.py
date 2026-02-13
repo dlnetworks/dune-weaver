@@ -1,6 +1,6 @@
 """Base MQTT handler interface."""
 from abc import ABC, abstractmethod
-from typing import Dict, Callable, List, Optional, Any
+from typing import Dict, List, Optional, Any
 
 class BaseMQTTHandler(ABC):
     """Abstract base class for MQTT handlers."""

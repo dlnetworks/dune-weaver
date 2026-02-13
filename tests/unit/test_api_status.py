@@ -8,7 +8,7 @@ Tests the following endpoints:
 - GET /api/table-info
 """
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock
 
 
 class TestSerialStatus:

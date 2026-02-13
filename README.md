@@ -6,6 +6,132 @@
 
 **An open-source kinetic sand art table that creates mesmerizing patterns using a ball controlled by precision motors.**
 
+## 🚀 Enhanced Fork - Standalone & UI Improvements
+
+> **Note:** This is a fork of the original [Dune Weaver](https://github.com/tuanchris/dune-weaver) project with enhancements focused on standalone operation (no Raspberry Pi), improved performance, and additional features.
+
+### Major Enhancements
+
+#### 🖥️ Standalone Simple Control Interface
+- **New `simple_control.py`** - A lightweight, standalone web interface for controlling your sand table
+  - Single-file Python server that can run independently
+  - Replicates the main Browse page functionality in a minimal package
+  - Auto-detects backend API configuration from `main.py`
+  - Command-line arguments for custom IP/port binding (`--ip`, `--port`)
+  - Perfect for headless setups or dedicated control panels
+  - Can be monitored, started, stopped, and restarted directly from the Settings page
+
+#### 📡 WebSocket Support for Wireless Operation
+- **FluidNC WebSocket Integration**
+  - Eliminates the need for USB cable tethering to the FluidNC ESP32
+  - Connect to your sand table wirelessly over your network
+  - Choose between Serial or WebSocket as the default connection method in Settings
+  - Requires WiFi-enabled FluidNC firmware
+  - Full bidirectional communication for real-time control and status updates
+
+#### ⚙️ Enhanced Server Management
+- **API Server Control** - Monitor, start, stop, and restart the API server directly from Settings
+- **Simple Control Server Management** - Control the standalone interface server from Settings
+- **Configurable API Settings** - Set custom API IP address and port in Settings
+- **Server Status Monitoring** - Real-time status indicators for all running services
+
+#### 🎨 UI & Workflow Improvements
+- **List View** - Added list view option to Browse and Playlist pages for easier navigation
+- **History Page** - Comprehensive history tracking of all executed patterns
+- **Dune Weaver Studio Integration** - Integrated pattern editing and conversion tools
+  - Adjust pattern zoom and orientation
+  - Convert G-code files to THR format
+  - Convert STL files to THR format
+  - Fine-tune pattern positioning and scale
+- **Enhanced Playlist Management**
+  - Insert patterns anywhere in the playlist, not just append to the end
+  - Start playback from any position by selecting a pattern and pressing play
+  - Add multiple instances of the same pattern to a playlist
+  - Remove individual pattern instances (not all instances) when duplicates exist
+
+#### 🧹 Pre-Execution Shell Commands
+- **Clear Pattern Automation** - Execute custom shell commands before any pattern starting with "clear" runs
+
+#### ⚡ Performance & Caching
+- **Multi-threaded Preview Generation**
+  - Defaults to using all available CPU threads for maximum performance
+  - User-configurable thread count in Settings for fine-tuning based on system resources
+  - Parallel processing of pattern previews
+  - Significant speedup for large pattern libraries
+- **Pattern Duration Cache** (`modules/core/pattern_duration_cache.py`)
+  - Pre-calculates estimated pattern run times based on configured ball movement speed
+  - Persistent cache eliminates need to recalculate durations on every load
+  - Faster pattern list loading and playlist duration estimates
+- **Preview Cache Management UI**
+  - View cache statistics (size, file count)
+  - One-click cache invalidation from Settings
+  - Automatic cleanup of orphaned cache files
+
+#### 🎯 LED & State Management
+- **Improved LED Integration**
+  - Better state synchronization with LED controller
+  - Enhanced idle timeout management
+  - Thread-safe LED operations
+  - More reliable LED state tracking
+
+#### 🔧 Technical Improvements
+- **Connection Management** - Improved serial connection handling and error recovery
+- **State Management** - Enhanced playlist and pattern state tracking
+- **API Enhancements** - Additional endpoints for queue management and cache operations
+
+### New Files Added
+- `simple_control.py` - Standalone control interface
+- `modules/core/pattern_duration_cache.py` - Duration caching system
+- `frontend/src/pages/HistoryPage.tsx` - Pattern history tracking
+- `frontend/src/pages/StudioPage.tsx` - Dune Weaver Studio integration
+
+### Modified Components
+- Enhanced `BrowsePage` with list view and improved layout options
+- Enhanced `PlaylistsPage` with list view and advanced insertion controls
+- Updated `SettingsPage` with server management, cache management, and worker configuration
+- Optimized `cache_manager`, `preview`, and `pattern_manager` modules
+- Enhanced LED controller and interface for better reliability
+- Improved `connection_manager` with WebSocket support
+
+### Usage
+
+#### Running the Standalone Control Interface
+```bash
+# Basic usage (binds to 0.0.0.0:9090, auto-detects backend)
+python simple_control.py
+
+# Custom IP and port
+python simple_control.py --ip 192.168.1.100 --port 8888
+
+# The interface auto-detects the backend API from main.py
+# or falls back to 127.0.0.1:8080
+```
+
+#### Configuration
+- Connection method (Serial/WebSocket) can be selected in Settings → Table Control
+- API IP and port can be configured in Settings
+- Worker count can be adjusted in Settings → Preview Cache section
+- Preview cache can be managed/cleared from Settings
+- Server status and controls available in Settings → System
+- All original Dune Weaver configuration options remain available
+
+### ⚠️ Development Status
+
+This fork is in **active development** and may contain bugs or incomplete features. Please report any issues you encounter.
+
+### 🔮 Upcoming Features
+
+The following enhancements are planned for future releases:
+
+- **HTTP Authentication** - Basic HTTP auth to password protect the Dune Weaver web UI and API
+- **SSL/TLS Support** - HTTPS support for secure connections
+
+---
+
+**Original Dune Weaver README follows below:**
+
+---
+
 ## Features
 
 - **Modern React UI** — A responsive, touch-friendly web interface that installs as a PWA on any device
